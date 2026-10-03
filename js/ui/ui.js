@@ -2,6 +2,8 @@
 // DOM code runs only inside createUI(); every formatting / derivation helper below is pure and exported
 // so Node tests can import this module without a browser.
 import { chartsAvailable, readTheme, createTempChart, createWindChart, SF_AXIS_MAX } from './charts.js';
+import * as CFG from '../config.js';
+import { computeEconomics, formatPayback } from '../econ.js';
 
 // ================================================================ pure helpers
 export const DASH = '—';
@@ -392,6 +394,228 @@ export function installProgress({ stepIndex = 0, steps = [], elapsedMin = 0, tot
   };
 }
 
+// ================================================================ pure helpers: custom values, economics, scenarios, CSV
+export const THEME_KEY = 'kroof.ui.theme';
+
+/** 'a.b.c' → obj.a.b.c (undefined when any link is missing). */
+export const getPath = (obj, path) => String(path).split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+/** ('econ.cost.A', 30) → { econ: { cost: { A: 30 } } } — the shape doSet() deep-merges. */
+export function nestedPatch(path, value) {
+  const keys = String(path).split('.');
+  const out = {};
+  let cur = out;
+  keys.forEach((k, i) => { if (i === keys.length - 1) cur[k] = value; else { cur[k] = {}; cur = cur[k]; } });
+  return out;
+}
+
+/** Flat path → default value for every customisable key (CUSTOM_SPEC numbers + customDefaults() incl. enums). */
+export function customDefaultMap(config = CFG) {
+  const map = {};
+  for (const [p, s] of Object.entries(config?.CUSTOM_SPEC || {})) map[p] = s.default;
+  const flatten = (o, pre) => {
+    for (const [k, v] of Object.entries(o || {})) {
+      const p = pre ? `${pre}.${k}` : k;
+      if (v && typeof v === 'object' && !Array.isArray(v)) flatten(v, p); else map[p] = v;
+    }
+  };
+  if (typeof config?.customDefaults === 'function') flatten(config.customDefaults(), '');
+  return map;
+}
+let defaultMapCache = null;
+
+/** Nested patch that sets every listed path back to its default (for the per-group '기본값으로' buttons). */
+export function defaultsPatch(paths, defaults) {
+  const out = {};
+  for (const p of paths || []) {
+    if (!defaults || !(p in defaults)) continue;
+    const keys = p.split('.');
+    let cur = out;
+    keys.forEach((k, i) => { if (i === keys.length - 1) cur[k] = defaults[p]; else cur = (cur[k] = cur[k] || {}); });
+  }
+  return out;
+}
+
+/** True when every listed path in the state equals its default (paths missing from the state count as default). */
+export function isDefault(st, paths, defaults) {
+  const def = defaults || (defaultMapCache = defaultMapCache || customDefaultMap());
+  for (const p of paths || []) {
+    if (!(p in def)) continue;
+    const cur = getPath(st, p);
+    if (cur === undefined) continue;
+    const d = def[p];
+    if (isNum(d) && isNum(cur)) { if (Math.abs(cur - d) > 1e-6) return false; } else if (cur !== d) return false;
+  }
+  return true;
+}
+
+/** Coating preset id whose α equals the given α (within half a slider step), else null ('사용자 지정'). */
+export function matchCoating(alpha, coatings = CFG.COATINGS || [], tol = 0.004) {
+  if (!isNum(alpha)) return null;
+  const hit = coatings.find((c) => isNum(c.alpha) && Math.abs(c.alpha - alpha) <= tol);
+  return hit ? hit.id : null;
+}
+
+/** Slider readout for a CUSTOM_SPEC entry: digits from the step, unit appended ('×' is attached). */
+export function fmtSpec(sp, v) {
+  if (!isNum(v)) return DASH;
+  const n = fmtNum(v, decimalsOf(sp?.step ?? 1));
+  const u = sp?.unit;
+  if (!u) return n;
+  return u === '×' ? `${n}×` : `${n} ${u}`;
+}
+
+/** Parse a typed number (accepts '−' and ',' decimals), clamp to spec.min/max, round to `decimals`. */
+export function parseNumInput(raw, sp, { decimals = 4 } = {}) {
+  const s = String(raw ?? '').trim().replace(/−/g, '-').replace(',', '.');
+  if (!/^[+-]?(\d+\.?\d*|\.\d+)$/.test(s)) return { ok: false, value: null, clamped: false };
+  let v = Number(s);
+  if (!Number.isFinite(v)) return { ok: false, value: null, clamped: false };
+  let clamped = false;
+  if (sp && isNum(sp.min) && v < sp.min) { v = sp.min; clamped = true; }
+  if (sp && isNum(sp.max) && v > sp.max) { v = sp.max; clamped = true; }
+  const f = 10 ** decimals;
+  v = Math.round(v * f) / f;
+  if (Object.is(v, -0)) v = 0;
+  return { ok: true, value: v, clamped };
+}
+
+/** '37.57°N, 126.98°E' */
+export function fmtLatLon(cs) {
+  if (!cs || !isNum(cs.lat) || !isNum(cs.lon)) return DASH;
+  return `${Math.abs(cs.lat).toFixed(2)}°${cs.lat < 0 ? 'S' : 'N'}, ${Math.abs(cs.lon).toFixed(2)}°${cs.lon < 0 ? 'W' : 'E'}`;
+}
+/** Site name for the header / HUD; the custom site reads '직접 입력 (37.57°N, 126.98°E)'. */
+export function siteLabel(siteId, sites = [], customSite = null) {
+  if (siteId === 'custom') return `직접 입력 (${fmtLatLon(customSite)})`;
+  return sites.find((s) => s.id === siteId)?.name || siteId || '';
+}
+
+/** Slot name as typed → trimmed, single-line, at most `max` characters (code points). */
+export function cleanSlotName(raw, max = 24) {
+  return Array.from(String(raw ?? '').replace(/[\r\n\t]+/g, ' ').trim()).slice(0, max).join('').trim();
+}
+/** savedAt (ms) → 'M/D HH:MM' in local time. */
+export function fmtSlotTime(ts) {
+  if (!isNum(ts)) return DASH;
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return DASH;
+  const p2 = (n) => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}/${d.getDate()} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+}
+/** Two-step confirm: press() → false (armed) then, within `ms`, press() → true (confirmed). */
+export function createConfirmGate(ms = 3000, clock = () => Date.now()) {
+  let armedAt = -Infinity;
+  const gate = {
+    armed: () => clock() - armedAt < ms,
+    press() { if (gate.armed()) { armedAt = -Infinity; return true; } armedAt = clock(); return false; },
+    cancel() { armedAt = -Infinity; },
+  };
+  return gate;
+}
+
+export function normalizeTheme(v) { return v === 'light' || v === 'dark' ? v : 'auto'; }
+/** Writes <html data-theme> ('light' | 'dark'); 'auto' removes it so prefers-color-scheme decides. */
+export function applyThemePref(root, pref) {
+  const p = normalizeTheme(pref);
+  if (!root) return p;
+  if (p === 'auto') root.removeAttribute('data-theme'); else root.setAttribute('data-theme', p);
+  return p;
+}
+
+// ---- economics table (computeEconomics → display model)
+export const ECON_COLUMNS = [
+  { key: 'cost', label: '설치비', unit: '만원', better: null },
+  { key: 'saveKWhDay', label: '하루 냉방 절감', unit: 'kWh', better: null },
+  { key: 'saveManYear', label: '연 전기료 절감', unit: '만원', better: 'max' },
+  { key: 'payback', label: '회수기간', unit: '', better: 'min' },
+  { key: 'roofDrop', label: '지붕 최고온도 저감', unit: '°C', better: 'max' },
+];
+export const ECON_NOTE = '선택한 날짜·기상의 하루 결과를 냉방일수만큼 반복한 추정입니다. 지붕 온도 저감에 따른 작업자 쾌적성·지붕 수명 효과, 유지보수 비용은 포함하지 않습니다.';
+
+/** Flags `best` on the most favourable cell of each column that defines `better` (≥ 2 candidates, not all equal). */
+function markBest(rows, columns) {
+  for (const col of columns) {
+    if (!col.better) continue;
+    const cand = rows.filter((r) => isNum(r.cells[col.key]?.v));
+    if (cand.length < 2) continue;
+    const vals = cand.map((r) => r.cells[col.key].v);
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    if (Math.abs(hi - lo) < 1e-9) continue;
+    const target = col.better === 'min' ? lo : hi;
+    for (const r of cand) if (Math.abs(r.cells[col.key].v - target) < 1e-9) r.cells[col.key].best = true;
+  }
+}
+
+/**
+ * Economics table for the designs (A–E). Same cell shape as buildCompareRows: cells[key] = { v, text, best? }.
+ * status: 'ok' | 'none' (no saving → the payback cell reads '절감 없음') | 'pending' (results not ready).
+ */
+export function buildEconRows(config, results = {}, st = {}) {
+  const ids = config.DESIGN_IDS || Object.keys(config.DESIGNS || {});
+  const econ = computeEconomics({ results: { thermal: results?.thermal || {} }, state: st, designIds: ids });
+  const rows = econ.rows.map((r) => {
+    const d = config.DESIGNS?.[r.id] || {};
+    const pending = r.status === 'pending';
+    const manYear = isNum(r.saveWonYear) ? r.saveWonYear / 10000 : null;
+    const cells = {
+      cost: { v: r.costMan, text: fmtPlain(r.costMan) },
+      saveKWhDay: { v: pending ? null : r.saveKWhDay, text: pending ? '…' : fmtNum(r.saveKWhDay, 2) },
+      saveManYear: { v: manYear, text: pending ? '…' : fmtNum(manYear, 1) },
+      payback: r.status === 'ok' ? { v: r.paybackYears, text: formatPayback(r.paybackYears) }
+        : { v: null, text: pending ? '…' : '절감 없음' },
+      roofDrop: { v: r.roofDrop, text: isNum(r.roofDrop) ? fmtNum(r.roofDrop, 1) : pending ? '…' : DASH },
+    };
+    return { id: r.id, name: d.name || r.id, color: d.color, status: r.status, cells };
+  });
+  markBest(rows, ECON_COLUMNS);
+  return { columns: ECON_COLUMNS, rows, baseline: econ.baseline, price: st?.econ?.price, days: st?.econ?.days };
+}
+
+/** One-line verdict for the selected design, e.g. 'A: 연 1.1만원 절감, 설치비 회수 27년'. */
+export function econSummary(model, id) {
+  if (!id || id === '0') return '기존 지붕은 비교 기준입니다. 설계안 A–E 중 하나를 선택하면 회수기간을 보여 줍니다.';
+  const r = model?.rows?.find((x) => x.id === id);
+  if (!r || r.status === 'pending') return `${id}: 계산 중…`;
+  if (r.status === 'none') return `${id}: 현재 조건에서는 냉방 전력 절감이 없어 설치비를 회수할 수 없습니다`;
+  return `${id}: 연 ${r.cells.saveManYear.text}만원 절감, 설치비 회수 ${r.cells.payback.text}`;
+}
+
+// ---- CSV export
+const csvCell = (v) => {
+  const s = String(v ?? '').replace(/^−/, '-');   // '−3.4' → '-3.4' so spreadsheets read it as a number
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+/**
+ * CSV text (UTF-8 BOM so Excel reads Korean) of the comparison table (all rows × all columns, units in the
+ * header, document ranges like '25–35' kept as text) followed by the economics table and the assumptions.
+ * econRows: the buildEconRows() model or just its rows array.  meta: { price, days, conditions }.
+ */
+export function buildCsv(compareModel, econRows, meta = {}) {
+  const lines = [];
+  const head = (c) => {
+    if (c.key === 'sf' && isNum(compareModel?.gust)) return `${c.label} (@${fmtPlain(compareModel.gust)} m/s)`;
+    return c.unit ? `${c.label} (${c.unit})` : c.label;
+  };
+  if (compareModel && Array.isArray(compareModel.rows)) {
+    const cols = compareModel.columns || COMPARE_COLUMNS;
+    lines.push(['설계안', '이름', ...cols.map(head)]);
+    for (const r of compareModel.rows) lines.push([shortName(r.id), r.name, ...cols.map((c) => r.cells?.[c.key]?.text ?? '')]);
+  }
+  const econ = Array.isArray(econRows) ? { columns: ECON_COLUMNS, rows: econRows } : econRows;
+  if (econ && Array.isArray(econ.rows)) {
+    if (lines.length) lines.push([]);
+    const cols = econ.columns || ECON_COLUMNS;
+    lines.push(['설계안', '이름', ...cols.map(head)]);
+    for (const r of econ.rows) lines.push([shortName(r.id), r.name, ...cols.map((c) => r.cells?.[c.key]?.text ?? '')]);
+  }
+  const extra = [];
+  if (isNum(meta.price)) extra.push(['전기요금 (원/kWh)', fmtPlain(meta.price)]);
+  if (isNum(meta.days)) extra.push(['연간 냉방일수 (일)', fmtPlain(meta.days)]);
+  if (meta.conditions) extra.push(['조건', meta.conditions]);
+  if (extra.length) { lines.push([]); lines.push(...extra); }
+  return `\uFEFF${lines.map((r) => r.map(csvCell).join(',')).join('\r\n')}\r\n`;
+}
+
 // ================================================================ DOM helpers (only called inside createUI)
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
@@ -440,7 +664,7 @@ function lsSet(k, v) { try { globalThis.localStorage?.setItem(k, v); } catch { /
 const DEFAULT_LEGEND_CSS = 'linear-gradient(90deg, #313695, #4575b4, #74add1, #abd9e9, #fee090, #fdae61, #f46d43, #d73027, #a50026)';
 
 // ================================================================ createUI
-export function createUI({ state, set, config, legend, getState } = {}) {
+export function createUI({ state, set, config, legend, getState, scenario } = {}) {
   if (typeof document === 'undefined') throw new Error('createUI() needs a DOM');
   const cfg = config || {};
   const S = () => (typeof getState === 'function' ? getState() : state) || {};
@@ -452,13 +676,21 @@ export function createUI({ state, set, config, legend, getState } = {}) {
   const PRESETS = cfg.WEATHER_PRESETS || [];
   const MARKERS = cfg.WIND_MARKERS || [];
   const getD = (id) => (id === '0' ? BASELINE : DESIGNS[id]) || BASELINE;
-  const siteName = (id) => SITES.find((s) => s.id === id)?.name || id || '';
+  const SPEC = cfg.CUSTOM_SPEC || CFG.CUSTOM_SPEC || {};
+  const spec = (path) => SPEC[path] || {};
+  const DEFAULTS = customDefaultMap({ CUSTOM_SPEC: SPEC, customDefaults: cfg.customDefaults || CFG.customDefaults });
+  const siteName = (id) => siteLabel(id, SITES, S().customSite);                              // header / HUD: full text
+  const siteShort = (id) => (id === 'custom' ? '직접 입력' : siteLabel(id, SITES));          // control summaries: short
 
   const viewport = document.getElementById('viewport');
   let hudRoot = document.getElementById('hud');
   if (!hudRoot && viewport) { hudRoot = h('div', { id: 'hud' }); viewport.append(hudRoot); }
   const controlsRoot = document.getElementById('controls');
   const dashRoot = document.getElementById('dashboard');
+
+  // The theme preference is UI-owned: <html data-theme> + localStorage (the charts re-read the tokens through the
+  // MutationObserver on data-theme further down). Applied before anything is built so the first paint is right.
+  let themePref = applyThemePref(document.documentElement, lsGet(THEME_KEY));
 
   // ---- UI-local state
   const results = { thermal: null, wind: null, curves: null };
@@ -573,10 +805,76 @@ export function createUI({ state, set, config, legend, getState } = {}) {
     const stored = lsGet(key);
     const det = h('details', { class: 'ctl-sec', id });
     det.open = stored === null ? open : stored === '1';
+    const dot = h('span', { class: 'chg-dot', title: '기본값에서 변경됨', hidden: true }, h('span', { class: 'sr', text: '(기본값에서 변경됨)' }));
     const sum = h('span', { class: 'sec-sum', id: `${id}-sum` });
-    det.append(h('summary', null, h('span', { class: 'sec-title', text: title }), sum), h('div', { class: 'sec-body' }, body));
+    det.append(h('summary', null, h('span', { class: 'sec-title', text: title }), dot, sum), h('div', { class: 'sec-body' }, body));
     det.addEventListener('toggle', () => lsSet(key, det.open ? '1' : '0'));
-    return { det, sum };
+    return { det, sum, dot };
+  }
+
+  /** Shows the section's '변경됨' dot while any of `paths` (or extra(st)) differs from its default. */
+  function trackChanges(sec, paths, extra) {
+    binders.push((st) => {
+      const changed = !isDefault(st, paths, DEFAULTS) || (extra ? !!extra(st) : false);
+      if (sec.dot.hidden === changed) sec.dot.hidden = !changed;
+    });
+  }
+
+  /** Slider wired to a CUSTOM_SPEC path: range, step, label and readout come from the spec; patch is the nested path. */
+  function specRange({ id, path, label, fmt, footMin, footMax, heavy = true, list, get, patch, doc }) {
+    const sp = spec(path);
+    return rangeField({
+      id, label: label ?? sp.label ?? path, min: sp.min, max: sp.max, step: sp.step, heavy, list, doc,
+      get: get || ((st) => getPath(st, path)),
+      patch: patch || ((v) => nestedPatch(path, v)),
+      fmt: fmt || ((v) => fmtSpec(sp, v)),
+      footMin, footMax,
+    });
+  }
+
+  function setInputValue(el, v) {
+    if (!isNum(v)) return;
+    const s = String(Math.round(v * 1e4) / 1e4);
+    if (el.value !== s) el.value = s;
+  }
+  /** Validates a typed number against CUSTOM_SPEC[path] (clamp + toast), writes it, or reverts the field. */
+  function commitNumber(el, path, decimals) {
+    const sp = spec(path);
+    const cur = getPath(S(), path);
+    const r = parseNumInput(el.value, sp, { decimals });
+    if (!r.ok) {
+      setInputValue(el, isNum(cur) ? cur : sp.default);
+      toast(`${sp.label || path}: 숫자를 입력하세요`);
+      return;
+    }
+    if (r.clamped) toast(`${sp.label || path}: ${fmtPlain(sp.min)}~${fmtPlain(sp.max)}${sp.unit === '°' ? '°' : sp.unit ? ` ${sp.unit}` : ''} 범위로 조정했습니다`);
+    setInputValue(el, r.value);
+    if (!isNum(cur) || Math.abs(cur - r.value) > 1e-9) doSet(nestedPatch(path, r.value));
+  }
+  /** Number <input> for a CUSTOM_SPEC path: commits on change/blur/Enter, follows the state while not focused. */
+  function numberInput({ id, path, decimals = 4, describedBy }) {
+    const sp = spec(path);
+    const inp = h('input', { type: 'number', id, class: 'txt-in', min: sp.min, max: sp.max, step: sp.step, inputmode: 'decimal', 'aria-describedby': describedBy });
+    const commit = () => commitNumber(inp, path, decimals);
+    inp.addEventListener('change', commit);
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); commit(); } });
+    binders.push((st) => { if (document.activeElement !== inp) setInputValue(inp, getPath(st, path) ?? sp.default); });
+    return inp;
+  }
+
+  function setThemePref(v) {
+    themePref = applyThemePref(document.documentElement, v);
+    lsSet(THEME_KEY, themePref);
+    onThemeChange();   // the MutationObserver does the same; this also covers browsers without it
+    scheduleSync();
+  }
+
+  /** Clipboard write that never throws → Promise<boolean>. Call it synchronously from the click handler. */
+  function writeClipboard(text) {
+    try {
+      const p = globalThis.navigator?.clipboard?.writeText(text);
+      return p ? Promise.resolve(p).then(() => true, () => false) : Promise.resolve(false);
+    } catch { return Promise.resolve(false); }
   }
 
   // ================================================================ HUD
@@ -687,8 +985,16 @@ export function createUI({ state, set, config, legend, getState } = {}) {
     ctl.paramsSum = secParams.sum;
 
     // 4. time & place
-    const siteSel = selectField({ id: 'ctl-site', label: '지역', options: SITES.map((s) => ({ value: s.id, label: s.name })),
+    const siteSel = selectField({ id: 'ctl-site', label: '지역',
+      options: [...SITES.map((s) => ({ value: s.id, label: s.name })), { value: 'custom', label: '직접 입력' }],
       get: (st) => st.siteId, onPick: (v) => doSet({ siteId: v }) });
+    // custom location: lat / lon / UTC offset, revealed only while 지역 = 직접 입력
+    ctl.customBox = h('div', { class: 'custom-site', id: 'custom-site', hidden: true },
+      h('div', { class: 'row-3 even' }, [['lat', 'ctl-lat', '위도', 4], ['lon', 'ctl-lon', '경도', 4], ['tz', 'ctl-tz', '표준시 (UTC+)', 2]].map(([key, id, label, dec]) =>
+        h('div', { class: 'field' }, h('label', { for: id, text: label }),
+          numberInput({ id, path: `customSite.${key}`, decimals: dec, describedBy: 'custom-site-hint' })))),
+      h('p', { class: 'table-note', id: 'custom-site-hint', text: '위도 −60~66°, 경도 −180~180°' }));
+    binders.push((st) => { const on = st.siteId === 'custom'; if (ctl.customBox.hidden === on) ctl.customBox.hidden = !on; });
     const monthSel = selectField({ id: 'ctl-month', label: '월', options: Array.from({ length: 12 }, (_, i) => ({ value: i + 1, label: `${i + 1}월` })),
       get: (st) => st.month, onPick: (v) => { const m = Number(v); doSet({ month: m, day: clampDay(m, S().day) }); } });
     ctl.daySel = h('select', { id: 'ctl-day' });
@@ -722,6 +1028,7 @@ export function createUI({ state, set, config, legend, getState } = {}) {
     ctl.sunTimes = h('p', { class: 'table-note', id: 'out-suntimes' });
     const secTime = section({ id: 'sec-time', title: '시간 · 장소', body: [
       h('div', { class: 'row-3' }, siteSel, monthSel, dayField),
+      ctl.customBox,
       hourRow,
       h('div', { class: 'field' }, h('span', { class: 'field-head' }, h('span', { class: 'seg-caption', text: '재생 속도 (시뮬레이션 시간/초)' })), speedSeg),
       ctl.sunTimes,
@@ -781,6 +1088,83 @@ export function createUI({ state, set, config, legend, getState } = {}) {
     ] });
     binders.push((st) => setText(secRoof.sum,
       `α ${fmtNum(st.roof?.alpha, 2)} · ${st.roof?.insulationMm ?? DASH}mm · ${st.interior?.acOn ? `AC ${fmtNum(st.interior?.setpoint, 0)}°C` : 'AC 끔'}`));
+    trackChanges(secRoof, ['roof.alpha', 'roof.insulationMm', 'interior.setpoint']);
+
+    // 6b. indoor thermal environment (advanced) — all heavy sliders; insulation stays in sync with the 0/50/75/100 buttons above
+    const ROOM_PATHS = ['roof.eps', 'roof.insulationMm', 'interior.internalGainW', 'interior.wallU', 'interior.windowArea', 'interior.achInfil', 'interior.acCOP'];
+    const roomFields = [
+      specRange({ id: 'ctl-roof-eps', path: 'roof.eps', footMin: '0.3 광택', footMax: '0.95 무광' }),
+      specRange({ id: 'ctl-ins-mm', path: 'roof.insulationMm', footMin: '0 없음', footMax: '150 mm' }),
+      specRange({ id: 'ctl-gain', path: 'interior.internalGainW', footMin: '0 W', footMax: '1500 W' }),
+      specRange({ id: 'ctl-wall-u', path: 'interior.wallU', footMin: '0.2 고단열', footMax: '2 무단열' }),
+      specRange({ id: 'ctl-window', path: 'interior.windowArea', footMin: '0 m²', footMax: '8 m²' }),
+      specRange({ id: 'ctl-ach', path: 'interior.achInfil', footMin: '0.1 기밀', footMax: '3 환기 잦음' }),
+    ];
+    const cop = specRange({ id: 'ctl-cop', path: 'interior.acCOP', footMin: '2 구형', footMax: '5 고효율' });
+    cop.field.title = '에어컨이 꺼져 있으면 적용되지 않습니다';
+    binders.push((st) => {
+      const on = !!st.interior?.acOn;
+      cop.input.disabled = !on;
+      cop.field.classList.toggle('is-disabled', !on);
+    });
+    const roomReset = h('button', { type: 'button', class: 'btn btn-sm', id: 'btn-room-reset', text: '기본값으로',
+      onclick: () => { doSet(defaultsPatch(ROOM_PATHS, DEFAULTS)); toast('실내 열환경을 기본값으로 되돌렸습니다'); } });
+    const secRoom = section({ id: 'sec-room', title: '실내 열환경 (고급)', open: false, body: [
+      h('div', { class: 'row between' },
+        h('span', { class: 'table-note', text: '기존 지붕·모든 설계안에 공통 적용 · 단열 두께는 「기존 지붕 · 실내」 버튼과 연동' }), roomReset),
+      ...roomFields.map((f) => f.field), cop.field,
+    ] });
+    binders.push((st) => setText(secRoom.sum,
+      `${fmtNum(st.interior?.internalGainW, 0)}W · U ${fmtPlain(st.interior?.wallU)} · 창 ${fmtPlain(st.interior?.windowArea)}m²`));
+    trackChanges(secRoom, ROOM_PATHS);
+
+    // 6c. heat-shield surface (designs A, B, C, E; D's shade net is unaffected)
+    const coatings = cfg.COATINGS || CFG.COATINGS || [];
+    const coatGrid = h('div', { class: 'coat-grid', role: 'radiogroup', 'aria-label': '차열판 윗면 도장 프리셋' });
+    const coatPairs = [...coatings, { id: 'custom', name: '사용자 지정', alpha: null }].map((c) => {
+      const isCustom = c.id === 'custom';
+      const inp = h('input', { type: 'radio', name: 'coat', id: `ctl-coat-${c.id}`, value: c.id, class: 'sr', disabled: isCustom });
+      if (!isCustom) inp.addEventListener('change', () => { if (inp.checked) doSet({ surface: { topAlpha: c.alpha } }); });
+      const a = h('span', { class: 'coat-a', text: isCustom ? '' : `α ${fmtNum(c.alpha, 2)}` });
+      const lab = h('label', { for: inp.id, class: isCustom ? 'coat coat-custom' : 'coat', title: isCustom ? '슬라이더로 조정한 값 (프리셋과 다름)' : `일사 흡수율 α ${fmtNum(c.alpha, 2)}`, style: isCustom ? null : { '--a': c.alpha } },
+        h('span', { class: 'coat-sw', 'aria-hidden': 'true' }), h('span', { class: 'coat-name', text: c.name }), a);
+      coatGrid.append(inp, lab);
+      return { inp, c, a, lab };
+    });
+    binders.push((st) => {
+      const alpha = st.surface?.topAlpha;
+      const m = matchCoating(alpha, coatings);
+      for (const p of coatPairs) {
+        if (p.c.id === 'custom') {
+          p.inp.checked = m === null;
+          setText(p.a, m === null && isNum(alpha) ? `α ${fmtNum(alpha, 2)}` : '');
+          if (isNum(alpha)) p.lab.style.setProperty('--a', String(alpha));
+        } else p.inp.checked = p.c.id === m;
+      }
+    });
+    const topAlpha = specRange({ id: 'ctl-surf-alpha', path: 'surface.topAlpha', label: '윗면 일사 흡수율 α', fmt: (v) => fmtNum(v, 2), footMin: '0.1 백색계', footMax: '0.95 흑색계' });
+    const paintEps = cfg.UNDERSIDE_PAINT_EPS ?? CFG.UNDERSIDE_PAINT_EPS ?? 0.9;
+    const underSeg = segmented({ name: 'underside', label: '차열판 아랫면', get: (st) => st.surface?.underside ?? 'foil',
+      options: [
+        { value: 'foil', label: '은박', id: 'ctl-underside-foil', title: '알루미늄 은박 (낮은 방사율)' },
+        { value: 'paint', label: `도장 (ε ${fmtPlain(paintEps)})`, id: 'ctl-underside-paint', title: '일반 도장면' },
+      ],
+      onPick: (v) => doSet({ surface: { underside: v } }) });
+    const foilEps = specRange({ id: 'ctl-foil-eps', path: 'surface.foilEps', label: '은박 방사율 ε', fmt: (v) => fmtNum(v, 2), footMin: '0.03 신품', footMax: '0.6 심한 노후' });
+    binders.push((st) => {
+      const off = (st.surface?.underside ?? 'foil') === 'paint';
+      foilEps.input.disabled = off;
+      foilEps.field.classList.toggle('is-disabled', off);
+    });
+    const secSurface = section({ id: 'sec-surface', title: '차열판 재료', body: [
+      h('div', { class: 'field' }, h('span', { class: 'field-head' }, h('span', { class: 'seg-caption', text: '윗면 도장 (일사 흡수율 α)' })), coatGrid),
+      topAlpha.field,
+      h('div', { class: 'field' }, h('span', { class: 'field-head' }, h('span', { class: 'seg-caption', text: '아랫면 (공기층 쪽)' })), underSeg),
+      foilEps.field,
+      h('p', { class: 'table-note', text: '설계안 A·B·C·E에 적용됩니다 (D 차광망 제외)' }),
+    ] });
+    binders.push((st) => setText(secSurface.sum, `α ${fmtNum(st.surface?.topAlpha, 2)} · ${(st.surface?.underside ?? 'foil') === 'paint' ? '도장' : '은박'}`));
+    trackChanges(secSurface, ['surface.topAlpha', 'surface.underside', 'surface.foilEps']);
 
     // 7. wind check
     const gust = rangeField({ id: 'ctl-gust', label: '순간풍속 (3초 돌풍)', min: 0, max: 50, step: 1, heavy: true,
@@ -818,11 +1202,50 @@ export function createUI({ state, set, config, legend, getState } = {}) {
       ctl.windReset.disabled = !on;
     });
     ctl.windReadout = h('div', { class: 'readout', id: 'out-wind-sf', 'aria-live': 'polite' });
+    // assumption adjusters: weathered / corroded fasteners and a harsher uplift coefficient
+    const capAdj = specRange({ id: 'ctl-cap-scale', path: 'windAdj.capScale', label: '체결부 용량 보정', footMin: '0.3 심한 노후·부식', footMax: '1.5 보강' });
+    const cpAdj = specRange({ id: 'ctl-cp-scale', path: 'windAdj.cpScale', label: '양력계수 보정', footMin: '0.5 완화', footMax: '1.5 가혹' });
+    const adjText = h('span', { id: 'out-windadj-text' });
+    ctl.windAdj = h('div', { class: 'readout', id: 'out-windadj', hidden: true }, adjText,
+      h('button', { type: 'button', class: 'btn btn-sm', id: 'btn-windadj-reset', text: '보정 해제',
+        onclick: () => doSet({ windAdj: { capScale: DEFAULTS['windAdj.capScale'] ?? 1, cpScale: DEFAULTS['windAdj.cpScale'] ?? 1 } }) }));
+    const adjOn = (st) => Math.abs((st.windAdj?.capScale ?? 1) - 1) > 1e-6 || Math.abs((st.windAdj?.cpScale ?? 1) - 1) > 1e-6;
+    binders.push((st) => {
+      const on = adjOn(st);
+      if (ctl.windAdj.hidden === on) ctl.windAdj.hidden = !on;
+      if (on) setText(adjText, `보정 적용 중 · 체결부 용량 ×${fmtNum(st.windAdj?.capScale ?? 1, 2)} · 양력계수 ×${fmtNum(st.windAdj?.cpScale ?? 1, 2)}`);
+    });
     const secWind = section({ id: 'sec-wind', title: '풍하중 점검', body: [
       h('div', { class: 'gust-track' }, gust.field), ctl.level, dirSel,
+      capAdj.field, cpAdj.field, ctl.windAdj,
       h('div', { class: 'row' }, ctl.blow, ctl.windReset), ctl.windReadout,
     ] });
-    binders.push((st) => setText(secWind.sum, `${fmtNum(st.gust, 0)} m/s · ${nearestDirection(st.windDirDeg).ko}풍`));
+    binders.push((st) => setText(secWind.sum, `${fmtNum(st.gust, 0)} m/s · ${nearestDirection(st.windDirDeg).ko}풍${adjOn(st) ? ' · 보정' : ''}`));
+    trackChanges(secWind, ['windAdj.capScale', 'windAdj.cpScale']);
+
+    // 7b. economics inputs (the payback table lives in the dashboard)
+    const ECON_PATHS = ['econ.price', 'econ.days', ...DIDS.map((id) => `econ.cost.${id}`)];
+    const price = specRange({ id: 'ctl-econ-price', path: 'econ.price', heavy: false });
+    const days = specRange({ id: 'ctl-econ-days', path: 'econ.days', heavy: false });
+    const costRows = DIDS.map((id) => {
+      const d = getD(id);
+      const inp = numberInput({ id: `ctl-cost-${id}`, path: `econ.cost.${id}`, decimals: 1 });
+      return h('div', { class: 'cost-row' },
+        h('label', { for: inp.id },
+          h('span', { class: 'cost-nm' }, h('span', { class: 'sw-chip', style: { '--c': d.color } }), h('b', { text: id }), h('span', { class: 'nm', text: d.name })),
+          h('small', { text: `문서 ${fmtRange(d.meta?.costManwon)}` })),
+        inp, h('span', { class: 'cost-unit', text: '만원' }));
+    });
+    const secEcon = section({ id: 'sec-econ', title: '경제성', body: [
+      price.field, days.field,
+      h('div', { class: 'row between' }, h('span', { class: 'ctl-label', text: '설치비 (만원)' }),
+        h('button', { type: 'button', class: 'btn btn-sm', id: 'btn-econ-reset', text: '기본값으로',
+          onclick: () => { doSet(defaultsPatch(ECON_PATHS, DEFAULTS)); toast('경제성 입력을 기본값으로 되돌렸습니다'); } })),
+      h('div', { class: 'cost-grid' }, costRows),
+      h('p', { class: 'table-note', text: '설치비 기본값은 문서에 적힌 비용 범위의 중간값입니다. 현장 견적으로 바꿔 보세요. 결과는 아래 「경제성 · 회수기간」 표에 나옵니다.' }),
+    ] });
+    binders.push((st) => setText(secEcon.sum, `${fmtNum(st.econ?.price, 0)}원/kWh · ${fmtNum(st.econ?.days, 0)}일`));
+    trackChanges(secEcon, ECON_PATHS);
 
     // 8. display
     const VIEW = [
@@ -841,12 +1264,176 @@ export function createUI({ state, set, config, legend, getState } = {}) {
       setText(secView.sum, `${on}/${VIEW.length} 켜짐`);
     });
 
+    // 9. screen & performance (theme is UI-owned; quality / auto-rotate are state read by main.js)
+    const THEME_LABEL = { auto: '자동', light: '라이트', dark: '다크' };
+    const QUALITY_LABEL = { auto: '자동', low: '낮음', medium: '보통', high: '높음' };
+    const themeSeg = segmented({ name: 'theme', label: '테마', get: () => themePref,
+      options: ['auto', 'light', 'dark'].map((v) => ({ value: v, label: THEME_LABEL[v], id: `ctl-theme-${v}` })),
+      onPick: (v) => setThemePref(v) });
+    const qualitySeg = segmented({ name: 'quality', label: '3D 화질', get: (st) => st.ui?.quality ?? 'auto',
+      options: ['auto', 'low', 'medium', 'high'].map((v) => ({ value: v, label: QUALITY_LABEL[v], id: `ctl-quality-${v}` })),
+      onPick: (v) => doSet({ ui: { quality: v } }) });
+    const rotate = toggle({ id: 'ctl-autorotate', label: '자동 회전 (3D 뷰)', get: (st) => !!st.ui?.autoRotate, onToggle: (on) => doSet({ ui: { autoRotate: on } }) });
+    const secApp = section({ id: 'sec-app', title: '화면 · 성능', open: false, body: [
+      h('div', { class: 'field' }, h('span', { class: 'field-head' }, h('span', { class: 'seg-caption', text: '테마' })), themeSeg),
+      h('div', { class: 'field' }, h('span', { class: 'field-head' }, h('span', { class: 'seg-caption', text: '3D 화질' })), qualitySeg,
+        h('span', { class: 'table-note', text: '느린 기기·6동 비교에서 끊기면 낮춤' })),
+      rotate,
+    ] });
+    binders.push((st) => setText(secApp.sum, `${THEME_LABEL[themePref]} · 화질 ${QUALITY_LABEL[st.ui?.quality] || QUALITY_LABEL.auto}`));
+    trackChanges(secApp, ['ui.quality', 'ui.autoRotate'], () => themePref !== 'auto');
+
+    // 10. scenarios (last; hidden when main.js passes no scenario object)
+    const secScen = buildScenarioSection();
+
     // phones: start with the long, less-used groups collapsed (unless the user chose otherwise before)
     const small = typeof matchMedia === 'function' && matchMedia('(max-width: 700px)').matches;
-    if (small) for (const s of [secWeather, secRoof, secView]) if (lsGet(`kroof.ui.sec.${s.det.id}`) === null) s.det.open = false;
+    const secs = [secDesign, secParams, secTime, secWeather, secRoof, secRoom, secSurface, secWind, secEcon, secView, secApp, secScen].filter(Boolean);
+    if (small) for (const s of [secWeather, secRoof, secRoom, secSurface, secEcon, secView, secApp, secScen]) if (s && lsGet(`kroof.ui.sec.${s.det.id}`) === null) s.det.open = false;
 
-    const flow = h('div', { class: 'ctl-flow' }, secDesign.det, secParams.det, secTime.det, secWeather.det, secRoof.det, secWind.det, secView.det);
+    const flow = h('div', { class: 'ctl-flow' }, secs.map((s) => s.det));
     controlsRoot.append(modeBlock, flow);
+  }
+
+  // ---- scenario section: saved slots · share link · reset · CSV (needs main.js's scenario object)
+  function buildScenarioSection() {
+    if (!scenario || typeof scenario !== 'object') return null;
+    const slotsApi = scenario.slots && typeof scenario.slots.list === 'function' ? scenario.slots : null;
+    const afterChange = () => { scheduleSync(); scheduleDash(0); };
+
+    // saved slots
+    const nameIn = h('input', { type: 'text', id: 'ctl-slot-name', class: 'txt-in', maxlength: '24', placeholder: '설정 이름 (최대 24자)', autocomplete: 'off', enterkeyhint: 'done', 'aria-label': '저장할 설정 이름' });
+    const slotList = h('ul', { class: 'slot-list', id: 'slot-list', 'aria-label': '저장된 설정' });
+    let secScenRef = null;
+    const readSlots = () => {
+      try { return [...(slotsApi?.list?.() || [])].sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0)); } catch (e) { console.error('[ui] slots.list failed', e); return []; }
+    };
+    function renderSlots() {
+      const items = readSlots();
+      if (!items.length) slotList.replaceChildren(h('li', { class: 'slot-empty muted', text: '저장된 설정이 없습니다' }));
+      else {
+        slotList.replaceChildren(...items.map((it) => h('li', { class: 'slot-row', 'data-name': it.name },
+          h('span', { class: 'slot-main' }, h('span', { class: 'slot-name', title: it.name, text: it.name }), h('span', { class: 'slot-time num', text: fmtSlotTime(it.savedAt) })),
+          h('button', { type: 'button', class: 'btn btn-sm', 'aria-label': `${it.name} 불러오기`, text: '불러오기', onclick: () => loadSlot(it.name) }),
+          h('button', { type: 'button', class: 'btn btn-sm', 'aria-label': `${it.name} 삭제`, text: '삭제', onclick: () => removeSlot(it.name) }))));
+      }
+      if (secScenRef) setText(secScenRef.sum, items.length ? `저장 ${items.length}개` : '저장 없음');
+    }
+    function saveSlot() {
+      const name = cleanSlotName(nameIn.value);
+      if (!name) { toast('저장할 설정 이름을 입력하세요'); nameIn.focus(); return; }
+      const existed = readSlots().some((s) => s.name === name);
+      let saved = false;
+      try { saved = !!slotsApi.save(name); } catch (e) { console.error('[ui] slots.save failed', e); }
+      if (!saved) { toast('저장하지 못했습니다. 이 브라우저에서는 저장 공간을 쓸 수 없습니다'); return; }
+      nameIn.value = '';
+      renderSlots();
+      toast(existed ? `"${name}" 설정을 덮어썼습니다` : `"${name}" 설정을 저장했습니다`);
+    }
+    function loadSlot(name) {
+      let ok = false;
+      try { ok = !!slotsApi.load(name); } catch (e) { console.error('[ui] slots.load failed', e); }
+      toast(ok ? `"${name}" 설정을 불러왔습니다` : `"${name}" 설정을 불러오지 못했습니다`);
+      if (ok) afterChange();
+    }
+    function removeSlot(name) {
+      try { slotsApi.remove(name); } catch (e) { console.error('[ui] slots.remove failed', e); }
+      renderSlots();
+      toast(`"${name}" 설정을 삭제했습니다`);
+    }
+    nameIn.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); saveSlot(); } });
+    const saveBtn = h('button', { type: 'button', class: 'btn btn-primary', id: 'btn-slot-save', text: '저장', onclick: saveSlot });
+    const slotBlock = slotsApi ? [
+      h('div', { class: 'ctl-label', text: '설정 저장 · 불러오기' }),
+      h('div', { class: 'name-row' }, nameIn, saveBtn),
+      slotList,
+    ] : [];
+
+    // share link (clipboard write happens synchronously inside the click so the browser still sees the user gesture)
+    const shareIn = h('input', { type: 'text', id: 'ctl-share-url', class: 'txt-in share-url', readonly: true, hidden: true, 'aria-label': '공유 링크 (전체 선택됨)' });
+    shareIn.addEventListener('focus', () => shareIn.select());
+    function showShareFallback(url) {
+      shareIn.value = url;
+      shareIn.hidden = false;
+      shareIn.focus();
+      shareIn.select();
+      try { shareIn.setSelectionRange(0, url.length); } catch { /* not selectable here */ }
+      toast('링크를 길게 눌러 복사하세요');
+    }
+    const copyBtn = h('button', { type: 'button', class: 'btn', id: 'btn-copy-link', text: '링크 복사' });
+    copyBtn.addEventListener('click', () => {
+      let url = '';
+      try { url = String(scenario.shareUrl?.() ?? ''); } catch (e) { console.error('[ui] shareUrl failed', e); }
+      if (!url) { toast('공유 링크를 만들지 못했습니다'); return; }
+      writeClipboard(url).then((ok) => {
+        if (ok) { shareIn.hidden = true; toast('공유 링크를 복사했습니다'); } else showShareFallback(url);
+      });
+    });
+
+    // reset (inline two-step confirm; no confirm() dialog)
+    const gate = createConfirmGate(3000);
+    let confirmTimer = null;
+    const resetBtn = h('button', { type: 'button', class: 'btn', id: 'btn-reset-all', text: '설정 초기화' });
+    const disarm = () => {
+      clearTimeout(confirmTimer); confirmTimer = null; gate.cancel();
+      resetBtn.textContent = '설정 초기화'; resetBtn.classList.remove('is-confirm');
+    };
+    resetBtn.addEventListener('click', () => {
+      if (gate.press()) {
+        disarm();
+        try { scenario.reset?.(); } catch (e) { console.error('[ui] reset failed', e); }
+        toast('모든 설정을 초기값으로 되돌렸습니다');
+        afterChange();
+      } else {
+        resetBtn.textContent = '정말 초기화? (다시 클릭)';
+        resetBtn.classList.add('is-confirm');
+        clearTimeout(confirmTimer);
+        confirmTimer = setTimeout(disarm, 3000);
+      }
+    });
+    resetBtn.addEventListener('blur', disarm);
+
+    // CSV of the results tables
+    const csvBtn = h('button', { type: 'button', class: 'btn', id: 'btn-export-csv', text: '결과 표 CSV 저장', onclick: exportCsv });
+
+    const sec = section({ id: 'sec-scenario', title: '시나리오', open: false, body: [
+      ...slotBlock,
+      h('div', { class: 'ctl-label', text: '공유 · 내보내기' }),
+      h('div', { class: 'row' }, copyBtn, csvBtn),
+      shareIn,
+      h('div', { class: 'row between' },
+        h('span', { class: 'table-note', text: '모든 입력값을 처음 상태로 되돌립니다' }), resetBtn),
+    ] });
+    secScenRef = sec;
+    renderSlots();
+    return sec;
+  }
+
+  /** Download the comparison + economics tables as CSV (UTF-8 BOM). Falls back to the clipboard when downloads are blocked. */
+  function exportCsv() {
+    const st = S();
+    if (!results.thermal) { toast('계산이 끝난 뒤에 저장할 수 있습니다'); return; }
+    const compare = buildCompareRows(cfg, results, { acOn: !!st.interior?.acOn, gust: st.gust });
+    const econ = buildEconRows(cfg, results, st);
+    const w = st.weather || {};
+    const csv = buildCsv(compare, econ, {
+      price: st.econ?.price, days: st.econ?.days,
+      conditions: `${siteName(st.siteId)} · ${fmtDate(st.month, st.day)} · 기온 ${fmtPlain(w.Tmax)}/${fmtPlain(w.Tmin)} °C · 순간풍속 ${fmtPlain(st.gust)} m/s`,
+    });
+    const p2 = (n) => String(n).padStart(2, '0');
+    const fileName = `kroof-${st.siteId || 'site'}-${p2(st.month)}${p2(st.day)}.csv`;
+    let saved = false;
+    try {
+      const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+      const a = h('a', { href: url, download: fileName, rel: 'noopener', style: { display: 'none' } });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      saved = true;
+    } catch (e) { console.error('[ui] csv download failed', e); }
+    if (saved) toast('CSV 파일을 저장했습니다 (엑셀에서 열 수 있습니다)');
+    else writeClipboard(csv).then((ok) => toast(ok ? '이 환경에서는 파일 저장이 막혀 있어 클립보드로 복사했습니다' : '파일 저장과 클립보드 복사가 모두 막혀 있습니다'));
   }
 
   function triggerInstall() {
@@ -958,6 +1545,30 @@ export function createUI({ state, set, config, legend, getState } = {}) {
       head('6동 비교표', '행을 누르면 해당 설계안 선택', 'h-compare'),
       h('div', { class: 'table-wrap dash-data' }, table), dash.cmpNote);
 
+    // d2. economics / payback (computeEconomics over the same results; re-rendered when results or econ inputs change)
+    dash.econBody = h('tbody');
+    dash.econSum = h('p', { class: 'econ-sum', id: 'econ-summary' });
+    dash.econNote = h('p', { class: 'table-note', id: 'econ-note' });
+    const econTable = h('table', { class: 'cmp econ', id: 'econ-table' },
+      h('caption', { class: 'sr', text: '설계안별 경제성 · 회수기간 비교표' }),
+      h('thead', null, h('tr', null,
+        h('th', { class: 'sticky-col', scope: 'col', text: '설계안' }),
+        ECON_COLUMNS.map((c) => h('th', { scope: 'col', id: `th-econ-${c.key}` }, c.label, c.unit ? h('small', { text: c.unit }) : null)))),
+      dash.econBody);
+    dash.econBody.addEventListener('click', (e) => {
+      const tr = e.target.closest('tr[data-id]');
+      if (tr) doSet({ design: tr.dataset.id });
+    });
+    dash.econBody.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const tr = e.target.closest('tr[data-id]');
+      if (tr) { e.preventDefault(); doSet({ design: tr.dataset.id }); }
+    });
+    const secEcon = h('section', { class: 'dash-sec', id: 'sec-econ-dash', 'aria-labelledby': 'h-econ' },
+      head('경제성 · 회수기간', '행을 누르면 해당 설계안 선택', 'h-econ'),
+      dash.econSum,
+      h('div', { class: 'table-wrap dash-data' }, econTable), dash.econNote);
+
     // e. wind
     dash.windLegend = h('div', { class: 'chart-legend', id: 'wind-legend' });
     dash.windCanvas = h('canvas', { id: 'chart-wind', role: 'img', 'aria-label': '설계안별 순간풍속에 따른 안전율 곡선' });
@@ -1002,7 +1613,7 @@ export function createUI({ state, set, config, legend, getState } = {}) {
           h('div', null, h('h3', { text: '열 모델' }), dash.assThermal),
           h('div', null, h('h3', { text: '풍하중 모델' }), dash.assWind))));
 
-    dashRoot.append(rowTop, secTemp, secCmp, rowWind, secInstall, assume);
+    dashRoot.append(rowTop, secTemp, secCmp, secEcon, rowWind, secInstall, assume);
     renderAssumptions();
     renderInstallList();
   }
@@ -1117,6 +1728,24 @@ export function createUI({ state, set, config, legend, getState } = {}) {
     setText(dash.cmpNote, `안전율은 현재 순간풍속 ${fmtPlain(st.gust)} m/s 기준. 강조된 칸은 A–E 중 가장 유리한 값(기존 지붕 제외). 문서 값의 범위는 "25–35"처럼 표기하고 비교는 중간값으로 함.${st.interior?.acOn ? '' : ' 에어컨이 꺼져 있어 냉방·절감 열은 비어 있음.'}`);
   }
 
+  // ---- d2. economics table
+  function renderEcon(st) {
+    if (!dash.econBody) return;
+    const model = buildEconRows(cfg, results, st);
+    dash.econBody.innerHTML = model.rows.map((r) => {
+      const sel = r.id === st.design;
+      const cells = model.columns.map((c) => {
+        const cell = r.cells[c.key];
+        const cls = [cell.best ? 'best' : '', c.key === 'payback' && r.status === 'none' ? 'na' : ''].filter(Boolean).join(' ');
+        return `<td${cls ? ` class="${cls}"` : ''}>${esc(cell.text)}</td>`;
+      }).join('');
+      return `<tr data-id="${esc(r.id)}" tabindex="0" class="${sel ? 'is-sel' : ''}" aria-selected="${sel}">
+        <td><span class="id-cell"><span class="sw-chip" style="--c:${esc(r.color)}"></span><b>${esc(shortName(r.id))}</b> ${esc(r.name)}</span></td>${cells}</tr>`;
+    }).join('');
+    setText(dash.econSum, econSummary(model, st.design));
+    setText(dash.econNote, ECON_NOTE + (st.interior?.acOn ? '' : ' 에어컨이 꺼져 있어도 에어컨을 켰을 때의 냉방 전력량을 기준으로 계산합니다.'));
+  }
+
   // ---- e. wind chart + load path
   function renderWind(st) {
     if (!dash.windLegend) return;
@@ -1223,6 +1852,11 @@ export function createUI({ state, set, config, legend, getState } = {}) {
     if (dashTimer) return;
     dashTimer = setTimeout(() => { dashTimer = null; renderDash(); }, delay);
   }
+  let econTimer = null;
+  function scheduleEcon() {
+    if (econTimer) return;
+    econTimer = setTimeout(() => { econTimer = null; try { renderEcon(S()); } catch (e) { console.error('[ui] econ render failed', e); } }, 30);
+  }
   function renderDash() {
     const st = S();
     const safe = (fn) => { try { fn(st); } catch (e) { console.error('[ui] render failed', e); } };
@@ -1230,6 +1864,7 @@ export function createUI({ state, set, config, legend, getState } = {}) {
     safe(renderKpis);
     safe(renderTemp);
     safe(renderCompare);
+    safe(renderEcon);
     safe(renderWind);
     safe(renderWindReadout);
   }
@@ -1253,6 +1888,7 @@ export function createUI({ state, set, config, legend, getState } = {}) {
 
   // ================================================================ sync
   let dashSig = null;
+  let lastEconSig = null;
   function syncFromState() {
     const st = S();
     if (!st) return;
@@ -1288,11 +1924,14 @@ export function createUI({ state, set, config, legend, getState } = {}) {
     } else if (windChart) {
       windChart.setGust(st.gust);
     }
+    // economics inputs only re-render the payback table (not the charts)
+    const econSig = [st.econ?.price, st.econ?.days, ...DIDS.map((id) => st.econ?.cost?.[id])].join(',');
+    if (econSig !== lastEconSig) { lastEconSig = econSig; scheduleEcon(); }
   }
 
   function renderTimeSummary(st) {
     const hr = isNum(clock.hour) ? clock.hour : st.hour;
-    if (ctl.timeSum) setText(ctl.timeSum, `${siteName(st.siteId)} · ${st.month}/${st.day} ${fmtHHMM(hr)}`);
+    if (ctl.timeSum) setText(ctl.timeSum, `${siteShort(st.siteId)} · ${st.month}/${st.day} ${fmtHHMM(hr)}`);
     if (ctl.sunTimes) {
       const t = sunTimes;
       setText(ctl.sunTimes, t && isNum(t.sunrise) && isNum(t.sunset)

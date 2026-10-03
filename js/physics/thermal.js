@@ -205,12 +205,15 @@ export function simulateDay(opts) {
   const V10 = Math.max(0, weather.windSpeed ?? 1.5);
   const clearness = clamp(weather.clearness ?? 1, 0, 1.1);
   const alphaR = clamp(roof.alpha ?? ROOF.alpha, 0, 1);
-  const epsR = ROOF.eps;
+  const epsR = clamp(roof.eps ?? ROOF.eps, 0.05, 1);
   const insMm = Math.max(0, roof.insulationMm ?? ROOF.insulationMm);
   const acOn = !!interior.acOn;
   const Tset = interior.setpoint ?? INTERIOR.setpoint;
   const Qint = interior.internalGainW ?? INTERIOR.internalGainW;
-  const COP = INTERIOR.acCOP;
+  const COP = Math.max(0.5, interior.acCOP ?? INTERIOR.acCOP);
+  // room envelope: user overrides fall back to the config defaults
+  const wallU = Math.max(0, interior.wallU ?? INTERIOR.wallU);
+  const achInfil = Math.max(0, interior.achInfil ?? INTERIOR.achInfil);
 
   const th = design && design.thermal ? design.thermal : null;
   // Footprint L×W (6×3) carries the shade layer; the heated roof PLATE is the part inside the perimeter
@@ -229,7 +232,7 @@ export function simulateDay(opts) {
   const Uloc = V10 * Math.pow(C.zRoof / 10, C.windExp);
 
   const H = CONTAINER.roofY;                                        // wall height (m)
-  const winTot = INTERIOR.windowArea;
+  const winTot = Math.max(0, interior.windowArea ?? INTERIOR.windowArea);
   const winRaw = { N: 0, E: 0, S: 0, W: 0 };
   for (const w of CONTAINER.windows || []) {
     const f = w.face === 'north' ? 'N' : w.face === 'south' ? 'S' : w.face === 'east' ? 'E' : 'W';
@@ -243,9 +246,9 @@ export function simulateDay(opts) {
     { az: 270, A: W * H, win: winTot * winRaw.W / rawSum },
   ];
   let UAwall = 0;
-  for (const f of faces) { f.wall = Math.max(0, f.A - f.win); UAwall += INTERIOR.wallU * f.wall; }
+  for (const f of faces) { f.wall = Math.max(0, f.A - f.win); UAwall += wallU * f.wall; }
   const volume = Ar * INTERIOR.heightInside;
-  const UAamb = INTERIOR.windowU * winTot + INTERIOR.floorU * Ar + INTERIOR.achInfil * volume / 3600 * AIR.rho * AIR.cp;
+  const UAamb = INTERIOR.windowU * winTot + INTERIOR.floorU * Ar + achInfil * volume / 3600 * AIR.rho * AIR.cp;
   const Cin = C.roomCap;
 
   // ---------------- shade layer description
@@ -360,7 +363,7 @@ export function simulateDay(opts) {
     for (const f of faces) {
       const cosInc = sp.elevation > 0 ? cosEl * Math.cos((sp.azimuth - f.az) * D2R) : 0;
       const I = irr.dni * Math.max(0, cosInc) + 0.5 * irr.dhi + 0.5 * C.groundAlbedo * irr.ghi;
-      sumUT += INTERIOR.wallU * f.wall * (Ta + C.wallAlpha * I / C.wallHo);
+      sumUT += wallU * f.wall * (Ta + C.wallAlpha * I / C.wallHo);
       qWin += INTERIOR.shgc * f.win * I;
     }
     fTsa[j] = UAwall > 0 ? sumUT / UAwall : Ta;

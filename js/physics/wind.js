@@ -37,12 +37,13 @@ function statusOf(sf) {
 }
 
 // Effective capacity of one load-path item (N per piece) and the sharing factor used.
-function itemCapacity(item, params) {
+function itemCapacity(item, params, capScale = 1) {
   let cap = item.capacityN;
   if (item.fromParam === 'strapLC') {
     const lcKN = Number.isFinite(params?.strapLC) ? params.strapLC : null;
     if (lcKN !== null) cap = lcKN * 1000 * STRAP_LEGS * STRAP_FACTOR;
   }
+  cap *= capScale;   // user derating (ageing / corrosion) or reinforcement
   const eta = item.count > SHARING_ETA.fewMax ? SHARING_ETA.many : SHARING_ETA.few;
   return { perItemN: cap, eta, totalN: item.count * cap * eta };
 }
@@ -63,16 +64,19 @@ function weightsAbove(design) {
 }
 
 /**
- * windCheck(design, { V, params }) → { V, q, upliftN, dragN, weightN, stages, sf, governing, criticalV, status }
+ * windCheck(design, { V, params, capScale = 1, cpScale = 1 }) → { V, q, upliftN, dragN, weightN, stages, sf, governing, criticalV, status }
+ * capScale multiplies every fastener capacity; cpScale multiplies the uplift pressure coefficient.
  */
-export function windCheck(design, { V = 0, params = {} } = {}) {
+export function windCheck(design, { V = 0, params = {}, capScale = 1, cpScale = 1 } = {}) {
   const Vs = Number.isFinite(V) ? Math.max(0, V) : 0;
   const q = velocityPressure(Vs);
   if (!design || !design.wind) {
     return { V: Vs, q, upliftN: 0, dragN: 0, weightN: 0, stages: [], sf: Infinity, governing: '—', criticalV: Infinity, status: 'ok' };
   }
   const w = design.wind;
-  const upliftN = q * w.cpUplift * w.planArea;
+  const cpUp = w.cpUplift * (Number.isFinite(cpScale) ? Math.max(0.01, cpScale) : 1);
+  const capK = Number.isFinite(capScale) ? Math.max(0, capScale) : 1;
+  const upliftN = q * cpUp * w.planArea;
   const dragN = q * (w.cpDrag || 0) * (w.sideArea || 0);
   const weightN = (w.selfWeightKg || 0) * G;
   const wAbove = weightsAbove(design);
@@ -80,7 +84,7 @@ export function windCheck(design, { V = 0, params = {} } = {}) {
   let sf = Infinity, governing = w.loadPath[0]?.stage ?? '—', minResist = Infinity;
   const stages = w.loadPath.map((st, i) => {
     const items = st.items.map((it) => {
-      const c = itemCapacity(it, params);
+      const c = itemCapacity(it, params, capK);
       return { name: it.name, count: it.count, capacityN: c.perItemN, eta: c.eta, totalN: c.totalN };
     });
     const capacityN = items.reduce((a, it) => a + it.totalN, 0);
@@ -91,7 +95,7 @@ export function windCheck(design, { V = 0, params = {} } = {}) {
     return { stage: st.stage, capacityN, demandN: upliftN, weightAboveN: wAbove[i], netDemandN: Math.max(0, upliftN - wAbove[i]), sf: sfi, items };
   });
   // governing stage is independent of V (all stages see the same uplift)
-  const k = 0.5 * RHO_AIR * w.cpUplift * w.planArea;
+  const k = 0.5 * RHO_AIR * cpUp * w.planArea;
   const criticalV = k > 0 && Number.isFinite(minResist) ? Math.sqrt(minResist / k) : Infinity;
   const out = { V: Vs, q, upliftN, dragN, weightN, stages, sf, governing, criticalV, status: statusOf(sf) };
   if (w.fuseNote) out.fuseNote = w.fuseNote;
@@ -99,11 +103,11 @@ export function windCheck(design, { V = 0, params = {} } = {}) {
 }
 
 /** Safety-factor curve for charts: V = step, 2·step, …, Vmax (V = 0 omitted because SF = ∞ there). */
-export function sfCurve(design, params, Vmax = 50, step = 1) {
+export function sfCurve(design, params, Vmax = 50, step = 1, adj = {}) {
   const out = [];
   const s = step > 0 ? step : 1;
   for (let V = s; V <= Vmax + 1e-9; V += s) {
-    const r = windCheck(design, { V, params });
+    const r = windCheck(design, { V, params, capScale: adj.capScale, cpScale: adj.cpScale });
     out.push({ V: Math.round(V * 1000) / 1000, sf: r.sf });
   }
   return out;

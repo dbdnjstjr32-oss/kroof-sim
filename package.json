@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node tools/dev-server.mjs",
     "build": "node tools/build-pages.mjs",
-    "test": "node tests/physics.test.mjs && node tests/smoke.test.mjs"
+    "test": "node tests/physics.test.mjs && node tests/custom.test.mjs && node tests/ui.test.mjs && node tests/smoke.test.mjs"
   },
   "devDependencies": {
     "three": "0.160.0"

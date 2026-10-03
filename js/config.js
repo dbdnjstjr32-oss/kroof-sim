@@ -305,3 +305,74 @@ export const COMPARE_LAYOUT = {
 
 // Temperature colour-map range for heat maps / legends (°C)
 export const TEMP_RANGE = [20, 80];
+
+// ---------------------------------------------------------------- user-customisable values
+// Flat path → { min, max, step, default, label, unit }. Single source for UI sliders AND for validating
+// shared links / saved scenarios (scenario.js clamps every incoming number to these ranges).
+export const CUSTOM_SPEC = {
+  // heat-shield surface (applies to the solid-panel designs A, B, C, E)
+  'surface.topAlpha':       { min: 0.10, max: 0.95, step: 0.01, default: 0.25, label: '윗면 일사 흡수율 α', unit: '' },
+  'surface.foilEps':        { min: 0.03, max: 0.60, step: 0.01, default: 0.05, label: '은박 방사율 ε', unit: '' },
+  // existing roof & room
+  'roof.alpha':             { min: 0.30, max: 0.95, step: 0.05, default: ROOF.alpha, label: '기존 지붕 일사 흡수율 α', unit: '' },
+  'roof.eps':               { min: 0.30, max: 0.95, step: 0.01, default: ROOF.eps, label: '기존 지붕 방사율 ε', unit: '' },
+  'roof.insulationMm':      { min: 0,    max: 150,  step: 5,    default: ROOF.insulationMm, label: '지붕 단열 두께', unit: 'mm' },
+  'interior.setpoint':      { min: 20,   max: 30,   step: 0.5,  default: INTERIOR.setpoint, label: '에어컨 설정온도', unit: '°C' },
+  'interior.internalGainW': { min: 0,    max: 1500, step: 50,   default: INTERIOR.internalGainW, label: '실내 발열(사람·기기)', unit: 'W' },
+  'interior.wallU':         { min: 0.20, max: 2.00, step: 0.05, default: INTERIOR.wallU, label: '벽체 열관류율 U', unit: 'W/m²K' },
+  'interior.windowArea':    { min: 0,    max: 8,    step: 0.2,  default: INTERIOR.windowArea, label: '창 면적', unit: 'm²' },
+  'interior.achInfil':      { min: 0.1,  max: 3.0,  step: 0.1,  default: INTERIOR.achInfil, label: '틈새 환기(침기)', unit: '회/h' },
+  'interior.acCOP':         { min: 2.0,  max: 5.0,  step: 0.1,  default: INTERIOR.acCOP, label: '에어컨 효율 COP', unit: '' },
+  // weather / time
+  'weather.Tmax':           { min: 20,   max: 40,   step: 0.5,  default: 35,  label: '최고기온', unit: '°C' },
+  'weather.Tmin':           { min: 10,   max: 32,   step: 0.5,  default: 26,  label: '최저기온', unit: '°C' },
+  'weather.windSpeed':      { min: 0,    max: 8,    step: 0.1,  default: 1.5, label: '평균 풍속', unit: 'm/s' },
+  'weather.clearness':      { min: 0.3,  max: 1.0,  step: 0.05, default: 0.95, label: '청명도', unit: '' },
+  'hour':                   { min: 0,    max: 24,   step: 0.25, default: 13.5, label: '시각', unit: 'h' },
+  'month':                  { min: 1,    max: 12,   step: 1,    default: 7,   label: '월', unit: '' },
+  'day':                    { min: 1,    max: 31,   step: 1,    default: 25,  label: '일', unit: '' },
+  'customSite.lat':         { min: -60,  max: 66,   step: 0.01, default: 37.5665, label: '위도', unit: '°' },
+  'customSite.lon':         { min: -180, max: 180,  step: 0.01, default: 126.978, label: '경도', unit: '°' },
+  'customSite.tz':          { min: -12,  max: 14,   step: 0.5,  default: 9,   label: '표준시(UTC+)', unit: 'h' },
+  // wind
+  'gust':                   { min: 0,    max: 50,   step: 1,    default: 26,  label: '순간풍속', unit: 'm/s' },
+  'windDirDeg':             { min: 0,    max: 360,  step: 45,   default: 270, label: '풍향', unit: '°' },
+  'windAdj.capScale':       { min: 0.30, max: 1.50, step: 0.05, default: 1.0, label: '체결부 용량 보정', unit: '×' },
+  'windAdj.cpScale':        { min: 0.50, max: 1.50, step: 0.05, default: 1.0, label: '양력계수 보정', unit: '×' },
+  // economics
+  'econ.price':             { min: 50,   max: 400,  step: 10,   default: 170, label: '전기요금', unit: '원/kWh' },
+  'econ.days':              { min: 10,   max: 200,  step: 5,    default: 90,  label: '연간 냉방일수', unit: '일' },
+  'econ.cost.A':            { min: 0, max: 500, step: 1, default: 30,   label: 'A 설치비', unit: '만원' },
+  'econ.cost.B':            { min: 0, max: 500, step: 1, default: 60,   label: 'B 설치비', unit: '만원' },
+  'econ.cost.C':            { min: 0, max: 500, step: 1, default: 17.5, label: 'C 설치비', unit: '만원' },
+  'econ.cost.D':            { min: 0, max: 500, step: 1, default: 11.5, label: 'D 설치비', unit: '만원' },
+  'econ.cost.E':            { min: 0, max: 500, step: 1, default: 40,   label: 'E 설치비', unit: '만원' },
+};
+// Per-design slider ranges (gap, shade, strapLC) are validated against DESIGNS[id].params.
+
+// Enumerations
+export const UNDERSIDE_OPTIONS = ['foil', 'paint'];            // silver foil (ε = surface.foilEps) vs painted (ε 0.9)
+export const UNDERSIDE_PAINT_EPS = 0.90;
+export const QUALITY_OPTIONS = ['auto', 'low', 'medium', 'high'];
+export const THEME_OPTIONS = ['auto', 'light', 'dark'];
+
+// Quick presets for the heat-shield top coating (solar absorptance α of the exposed face).
+export const COATINGS = [
+  { id: 'white',  name: '무광 백색 (차열도장)', alpha: 0.25 },
+  { id: 'silver', name: '알루미늄 은색',        alpha: 0.35 },
+  { id: 'gray',   name: '회색',                 alpha: 0.60 },
+  { id: 'black',  name: '검정',                 alpha: 0.92 },
+];
+
+/** Default value of every custom key in the shape of the app state (nested). */
+export function customDefaults() {
+  const cost = {};
+  for (const id of DESIGN_IDS) { const r = DESIGNS[id].meta.costManwon; cost[id] = CUSTOM_SPEC[`econ.cost.${id}`]?.default ?? (r[0] + r[1]) / 2; }
+  return {
+    surface: { topAlpha: CUSTOM_SPEC['surface.topAlpha'].default, underside: 'foil', foilEps: CUSTOM_SPEC['surface.foilEps'].default },
+    windAdj: { capScale: 1, cpScale: 1 },
+    econ: { price: CUSTOM_SPEC['econ.price'].default, days: CUSTOM_SPEC['econ.days'].default, cost },
+    customSite: { lat: 37.5665, lon: 126.978, tz: 9 },
+    ui: { quality: 'auto', autoRotate: false },
+  };
+}

@@ -6,8 +6,10 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
 import * as config from './config.js';
 import {
   DESIGNS, DESIGN_IDS, ALL_IDS, SITES, WEATHER_PRESETS, COMPARE_LAYOUT, TEMP_RANGE,
-  ROOF, INTERIOR, getDesign, defaultParams,
+  ROOF, INTERIOR, getDesign, defaultParams, customDefaults,
 } from './config.js';
+import { effectiveDesign, applySurfaceAppearance } from './custom.js';
+import { snapshot, sanitize, deepMerge, decodeShare, shareUrl, createSlotStore } from './scenario.js';
 import { createMaterials } from './materials.js';
 import { disposeTree } from './parts.js';
 import { buildContainer } from './container.js';
@@ -37,22 +39,30 @@ const state = {
   siteId: 'seoul', month: preset.month, day: preset.day, hour: 13.5, playing: false, speed: 1.5,
   weatherPreset: preset.id,
   weather: { Tmax: preset.Tmax, Tmin: preset.Tmin, windSpeed: preset.windSpeed, clearness: preset.clearness },
-  roof: { alpha: ROOF.alpha, insulationMm: ROOF.insulationMm },
-  interior: { acOn: true, setpoint: INTERIOR.setpoint, internalGainW: INTERIOR.internalGainW },
+  roof: { alpha: ROOF.alpha, eps: ROOF.eps, insulationMm: ROOF.insulationMm },
+  interior: {
+    acOn: true, setpoint: INTERIOR.setpoint, internalGainW: INTERIOR.internalGainW,
+    wallU: INTERIOR.wallU, windowArea: INTERIOR.windowArea, achInfil: INTERIOR.achInfil, acCOP: INTERIOR.acCOP,
+  },
   gust: 26, windDirDeg: 270,
   params: Object.fromEntries(DESIGN_IDS.map((id) => [id, defaultParams(id)])),
   view: { heatmap: true, flow: true, rays: true, labels: true, sunPath: true, section: false, explode: 0, windSim: false },
   camera: 'iso',
   actions: { installSeq: 0, blowSeq: 0 },
+  ...customDefaults(),   // surface, windAdj, econ, customSite, ui
 };
 
-const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
-function deepMerge(dst, src) {
-  for (const [k, v] of Object.entries(src)) {
-    if (isObj(v) && isObj(dst[k])) deepMerge(dst[k], v); else dst[k] = v;
-  }
-  return dst;
-}
+// Reset target = the defaults as they are BEFORE a shared link or a saved scenario is applied.
+const DEFAULT_SNAPSHOT = snapshot(state);
+
+// A share link (#s=…) restores the sender's settings; every value is clamped by sanitize().
+const sharedFromLink = typeof location !== 'undefined' ? decodeShare(location.hash) : null;
+if (sharedFromLink) deepMerge(state, sharedFromLink);
+
+// Graphics quality survives reloads (it is a per-device setting, not part of a shared scenario).
+const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } };
+{ const q = lsGet('kroof.quality'); if (['auto', 'low', 'medium', 'high'].includes(q)) state.ui.quality = q; }
 
 // ------------------------------------------------------------------ DOM / renderer
 const host = document.getElementById('viewport') || (() => {
@@ -299,7 +309,9 @@ controls.addEventListener('start', () => { camTween = null; });
 
 // ------------------------------------------------------------------ sun
 let sunNow = { dir: new THREE.Vector3(0, 1, 0), azimuth: 180, elevation: 60, ghi: 0, dni: 0, dhi: 0 };
-const site = () => SITES.find((s) => s.id === state.siteId) || SITES[0];
+const site = () => (state.siteId === 'custom'
+  ? { id: 'custom', name: '직접 입력', lat: state.customSite.lat, lon: state.customSite.lon, tz: state.customSite.tz }
+  : SITES.find((s) => s.id === state.siteId) || SITES[0]);
 const doy = () => dayOfYear(state.month, state.day);
 
 function sunAt(hour) {
@@ -325,7 +337,8 @@ const results = { thermal: {}, wind: {}, curves: {} };
 const PROFILE_HOURS = Array.from({ length: 49 }, (_, i) => i * 0.5);
 
 function profileKey(id) {
-  return `${id}|${JSON.stringify(state.params[id])}|${state.siteId}|${state.month}-${state.day}`;
+  const s = site();
+  return `${id}|${JSON.stringify(state.params[id])}|${s.lat},${s.lon},${s.tz}|${state.month}-${state.day}`;
 }
 
 function ensureProfile(unit) {
@@ -362,7 +375,7 @@ function runThermal(ids = ALL_IDS) {
     const unit = units[id];
     const p = id === '0' ? null : ensureProfile(unit);
     const opts = {
-      design: getDesign(id),
+      design: effectiveDesign(id, state),
       params: state.params[id] || {},
       site: { lat: s.lat, lon: s.lon, tz: s.tz },
       dayOfYear: doy(),
@@ -376,14 +389,19 @@ function runThermal(ids = ALL_IDS) {
     r.summary.TinMaxFree = state.interior.acOn
       ? simulateDay({ ...opts, interior: { ...opts.interior, acOn: false } }).summary.TinMax
       : r.summary.TinMax;
+    // Daily electricity with AC on, independent of the AC switch — what the payback estimate is based on.
+    r.summary.acKWhRef = state.interior.acOn
+      ? r.summary.acKWh
+      : simulateDay({ ...opts, interior: { ...opts.interior, acOn: true } }).summary.acKWh;
     results.thermal[id] = r;
   }
 }
 
 function runWind(ids = DESIGN_IDS) {
   for (const id of ids) {
-    results.wind[id] = windCheck(DESIGNS[id], { V: state.gust, params: state.params[id] });
-    results.curves[id] = sfCurve(DESIGNS[id], state.params[id], 50, 1);
+    const adj = state.windAdj;
+    results.wind[id] = windCheck(effectiveDesign(id, state), { V: state.gust, params: state.params[id], capScale: adj.capScale, cpScale: adj.cpScale });
+    results.curves[id] = sfCurve(effectiveDesign(id, state), state.params[id], 50, 1, adj);
   }
 }
 
@@ -438,11 +456,17 @@ function set(patch) {
       }
     }
   }
-  if (changed((s) => [s.siteId, s.month, s.day])) {
+  if (changed((s) => [s.siteId, s.month, s.day, s.siteId === 'custom' ? s.customSite : 0])) {
     ALL_IDS.forEach((id) => dirty.thermal.add(id)); dirty.sunPath = true; heavy = true; hourDirty = true;
   }
   if (changed((s) => [s.weather, s.roof, s.interior])) { ALL_IDS.forEach((id) => dirty.thermal.add(id)); heavy = true; hourDirty = true; }
-  if (changed((s) => s.gust)) { DESIGN_IDS.forEach((id) => dirty.wind.add(id)); heavy = true; }
+  if (changed((s) => s.surface)) {
+    applySurfaceAppearance(mats, state.surface);
+    ALL_IDS.forEach((id) => dirty.thermal.add(id)); DESIGN_IDS.forEach((id) => dirty.wind.add(id)); heavy = true; hourDirty = true;
+  }
+  if (changed((s) => [s.gust, s.windAdj])) { DESIGN_IDS.forEach((id) => dirty.wind.add(id)); heavy = true; }
+  if (changed((s) => s.ui.quality)) { applyQuality(); lsSet('kroof.quality', state.ui.quality); }
+  if (changed((s) => s.ui.autoRotate)) controls.autoRotate = !!state.ui.autoRotate;
   if (changed((s) => s.hour)) hourDirty = true;
 
   if (changed((s) => [s.mode, s.design])) {
@@ -502,7 +526,7 @@ function startInstall() {
 function startBlow() {
   const id = state.design;
   if (id === '0') { ui?.toast?.('설계안 A~E를 선택하면 풍하중 이탈을 시뮬레이션합니다.'); return; }
-  const w = results.wind[id] || windCheck(DESIGNS[id], { V: state.gust, params: state.params[id] });
+  const w = results.wind[id] || windCheck(effectiveDesign(id, state), { V: state.gust, params: state.params[id], capScale: state.windAdj.capScale, cpScale: state.windAdj.cpScale });
   state.view.windSim = true;
   if (w.sf < 1) {
     animator.blowOff(units[id].model, { windDirDeg: state.windDirDeg, V: state.gust });
@@ -567,14 +591,62 @@ function pushClock() {
   });
 }
 
+// ------------------------------------------------------------------ graphics quality
+const QUALITY = {
+  low:    { pixelRatio: 1,   shadow: 1024, particles: 250 },
+  medium: { pixelRatio: 1.5, shadow: 2048, particles: 450 },
+  high:   { pixelRatio: 2,   shadow: 4096, particles: 700 },
+};
+function resolveQuality() {
+  if (state.ui.quality !== 'auto') return state.ui.quality;
+  // phones/tablets (coarse pointer) start at 'medium' to keep the 6-unit yard smooth
+  return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches ? 'medium' : 'high';
+}
+function applyQuality() {
+  const q = QUALITY[resolveQuality()];
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, q.pixelRatio));
+  resize();
+  const sh = env.sun.shadow;
+  if (sh.mapSize.x !== q.shadow) { sh.mapSize.set(q.shadow, q.shadow); sh.map?.dispose?.(); sh.map = null; }
+  for (const u of Object.values(units)) u.flow.object.geometry.setDrawRange(0, q.particles);
+}
+
+// ------------------------------------------------------------------ scenarios (save / load / share / reset)
+const slotStore = createSlotStore((() => { try { return localStorage; } catch { return null; } })());
+const scenario = {
+  snapshot: () => snapshot(state),
+  apply(obj) { const clean = sanitize(obj); if (!Object.keys(clean).length) return false; set(clean); return true; },
+  reset() { set(JSON.parse(JSON.stringify(DEFAULT_SNAPSHOT))); ui?.toast?.('설정을 초기화했습니다.'); },
+  shareUrl: () => shareUrl(location.href, snapshot(state), DEFAULT_SNAPSHOT),
+  slots: {
+    list: () => slotStore.list(),
+    save(name) {
+      const ok = slotStore.save(name, snapshot(state));
+      ui?.toast?.(ok ? `'${String(name).trim().slice(0, 24)}' 저장했습니다.` : '저장할 수 없습니다. 이름을 확인하거나 브라우저 저장소 설정을 확인하세요.');
+      return ok;
+    },
+    load(name) {
+      const data = slotStore.load(name);
+      if (!data) { ui?.toast?.('저장된 설정을 불러올 수 없습니다.'); return false; }
+      set(data); ui?.toast?.(`'${name}' 불러왔습니다.`); return true;
+    },
+    remove: (name) => slotStore.remove(name),
+  },
+};
+
 // ------------------------------------------------------------------ boot
-ui = createUI({ state, set, config, legend: { css: HEAT_CSS_GRADIENT, min: TEMP_RANGE[0], max: TEMP_RANGE[1] } });
+applySurfaceAppearance(mats, state.surface);
+ui = createUI({ state, set, config, scenario, legend: { css: HEAT_CSS_GRADIENT, min: TEMP_RANGE[0], max: TEMP_RANGE[1] } });
+if (sharedFromLink) ui?.toast?.('공유받은 설정을 불러왔습니다.');
 ui?.setAssumptions?.({ thermal: THERMAL_ASSUMPTIONS, wind: WIND_ASSUMPTIONS });
 
 for (const id of DESIGN_IDS) buildModel(id);
 units['0'].flow.setGap(null);
 applyLayout();
 applySection();
+applyQuality();
+controls.autoRotate = !!state.ui.autoRotate;
+controls.autoRotateSpeed = 1.2;
 updateSunPath();
 updateSun();
 ui?.setBusy?.(true);
@@ -664,4 +736,4 @@ function advance(dt) {
 requestAnimationFrame(frame);
 
 // Debug handle for the console
-window.kroof = { state, set, units, results, scene, camera, renderer, controls, advance, flush };
+window.kroof = { state, set, units, results, scene, camera, renderer, controls, advance, flush, scenario, get ui() { return ui; } };
