@@ -149,7 +149,23 @@ export function acpSandwichPanel(w, d, t, matTop, matBottom, matCore, matEdge) {
   );
   const gBot = prep(new THREE.BoxGeometry(w, skinT, d).translate(0, -t / 2 + skinT / 2, 0), [3, 3, 2, 1, 3, 3]);
 
-  const merged = mergeGeometries([gTop, gCore, gBot], false);
+  // NOTE: mergeGeometries(..., false) drops groups, and a multi-material Mesh without groups renders NOTHING.
+  // Concatenate the pieces manually and keep one group per face with its material index.
+  const pieces = [gTop, gCore, gBot];
+  const merged = new THREE.BufferGeometry();
+  for (const name of ['position', 'normal', 'uv']) {
+    const itemSize = gTop.attributes[name].itemSize;
+    const total = pieces.reduce((n, g) => n + g.attributes[name].count, 0);
+    const arr = new Float32Array(total * itemSize);
+    let off = 0;
+    for (const g of pieces) { arr.set(g.attributes[name].array, off); off += g.attributes[name].array.length; }
+    merged.setAttribute(name, new THREE.BufferAttribute(arr, itemSize));
+  }
+  let start = 0;
+  for (const g of pieces) {
+    for (const grp of g.groups) merged.addGroup(start + grp.start, grp.count, grp.materialIndex);
+    start += g.attributes.position.count;
+  }
   const mats = [matTop, matBottom, matCore || matEdge, matEdge || matBottom];
   return shadows(new THREE.Mesh(merged, mats));
 }

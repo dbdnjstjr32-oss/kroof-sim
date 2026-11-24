@@ -80,6 +80,20 @@ for (const id of DESIGN_IDS) {
   });
   check(nanMeshes.length === 0, `${id}: all ${allMeshes.length} meshes have finite non-empty vertices`);
 
+  // RENDERABILITY: a multi-material Mesh whose geometry has no groups (or groups that do not cover every vertex) draws nothing in three.js
+  const unrenderable = allMeshes.filter((mesh) => {
+    if (!Array.isArray(mesh.material)) return false;
+    const geo = mesh.geometry;
+    const total = geo.index ? geo.index.count : geo.attributes.position.count;
+    const covered = geo.groups.reduce((n, g) => n + g.count, 0);
+    const badIdx = geo.groups.some((g) => !mesh.material[g.materialIndex]);
+    return geo.groups.length === 0 || covered !== total || badIdx;
+  });
+  check(unrenderable.length === 0, `${id}: every multi-material mesh has groups covering all vertices (unrenderable=${unrenderable.length})`);
+  for (const ts of m.topSurfaces) {
+    check(Array.isArray(ts.material) ? ts.geometry.groups.some((g) => ts.material[g.materialIndex] && g.count > 0) : true, `${id}: top surface is drawable`);
+  }
+
   // Verify panel/support meshes do not pierce interior (y < 2.79 within roof footprint)
   const nonExteriorKeys = new Set(['acp', 'panel', 'crossbar', 'leveler', 'pad', 'latch', 'wingbolt']);
   const intruding = [];
