@@ -1,134 +1,195 @@
-// Cross-module integration smoke test (headless). Run: node tests/smoke.test.mjs
-// Builds the container and every design with min/default/max params and checks the CONTRACT,
-// then runs the shade analyser + physics on real geometry, exactly as main.js does.
+// 3D container, design assemblies (B/C/Cp), install/disassemble animator, and viz helpers smoke tests
+import { strict as assert } from 'node:assert';
 import * as THREE from 'three';
-import { CONTAINER, DESIGNS, DESIGN_IDS, ALL_IDS, getDesign, defaultParams, SITES } from '../js/config.js';
+import { CONTAINER, DESIGN_IDS, INSTALL_IDS, getDesign } from '../js/config.js';
 import { createMaterials } from '../js/materials.js';
 import { buildContainer } from '../js/container.js';
-import { dayOfYear, solarPosition } from '../js/physics/sun.js';
-import { simulateDay } from '../js/physics/thermal.js';
-import { windCheck } from '../js/physics/wind.js';
+import { build as buildB } from '../js/designs/designB.js';
+import { build as buildC } from '../js/designs/designC.js';
+import { build as buildCp } from '../js/designs/designCp.js';
+import { createAnimator } from '../js/viz/animator.js';
+import { createGapFlow } from '../js/viz/flow.js';
 import { createShadeAnalyzer } from '../js/viz/shade.js';
+import { createRoofHeatmap, tempToRGB } from '../js/viz/heatmap.js';
+import { createSunRays } from '../js/viz/rays.js';
 
-const builders = {};
-for (const id of DESIGN_IDS) builders[id] = (await import(`../js/designs/design${id}.js`)).build;
-
-let fails = 0;
-const ok = (cond, msg) => { if (!cond) { fails++; console.log('  ✗', msg); } };
-const tris = (obj) => {
-  let n = 0;
-  obj.traverse((o) => {
-    if (!o.isMesh || !o.geometry) return;
-    const g = o.geometry;
-    const c = (g.index ? g.index.count : g.attributes.position.count) / 3;
-    n += o.isInstancedMesh ? c * o.count : c;
-  });
-  return Math.round(n);
-};
-
-const mats = createMaterials();
-
-// ---- container
-const cont = buildContainer({ mats });
-cont.group.updateMatrixWorld(true);
-const cb = new THREE.Box3().setFromObject(cont.group);
-console.log(`container: tris=${tris(cont.group)} bbox y ${cb.min.y.toFixed(3)}..${cb.max.y.toFixed(3)} x ${cb.min.x.toFixed(2)}..${cb.max.x.toFixed(2)} z ${cb.min.z.toFixed(2)}..${cb.max.z.toFixed(2)}`);
-ok(cont.roofMesh?.isMesh, 'container.roofMesh is a mesh');
-const rb = new THREE.Box3().setFromObject(cont.roofMesh);
-ok(Math.abs(rb.max.y - CONTAINER.roofY) < 0.002, `roof top at ${rb.max.y.toFixed(4)} (want ${CONTAINER.roofY})`);
-ok(cb.max.y <= CONTAINER.ringCenterY + CONTAINER.ringR + CONTAINER.ringBarR + 0.01, `container max y ${cb.max.y.toFixed(3)} ≤ ring top`);
-
-// ---- designs
-const analyzer = createShadeAnalyzer({ nx: 24, nz: 12 });
-const site = SITES[0];
-const doy = dayOfYear(7, 25);
-const sunDir = (h) => {
-  const p = solarPosition({ dayOfYear: doy, hour: h, lat: site.lat, lon: site.lon, tz: site.tz });
-  return p.elevation > 0 ? new THREE.Vector3(p.dir.x, p.dir.y, p.dir.z) : null;
-};
-const hours = Array.from({ length: 49 }, (_, i) => i * 0.5);
-const rows = [];
-
-for (const id of DESIGN_IDS) {
-  const d = DESIGNS[id];
-  for (const which of ['min', 'default', 'max']) {
-    const params = defaultParams(id);
-    for (const [k, p] of Object.entries(d.params)) params[k] = which === 'default' ? p.default : p[which];
-    let m;
-    try { m = builders[id]({ mats, params }); } catch (e) { fails++; console.log(`  ✗ ${id} build(${which}) threw: ${e.stack}`); continue; }
-    const root = new THREE.Group();
-    root.add(cont.group.clone(false));
-    root.add(m.group);
-    root.updateMatrixWorld(true);
-
-    const tag = `${id}/${which}`;
-    ok(m.id === id, `${tag} id`);
-    ok(m.group?.isObject3D, `${tag} group`);
-    ok(Array.isArray(m.parts) && m.parts.length > 0, `${tag} parts`);
-    ok(m.parts.length === d.meta.partKinds || (id === 'C' && m.parts.length >= 3), `${tag} part kinds ${m.parts.length} vs doc ${d.meta.partKinds}`);
-    // every object in exactly one install step
-    const inStep = new Map();
-    for (const s of m.installSteps) for (const o of s.objects) inStep.set(o, (inStep.get(o) || 0) + 1);
-    ok([...inStep.values()].every((n) => n === 1), `${tag} objects appear in exactly one step`);
-    const covered = new Set();
-    for (const o of inStep.keys()) o.traverse((c) => covered.add(c));
-    let orphans = 0;
-    m.group.traverse((o) => { if (o.isMesh && !covered.has(o)) orphans++; });
-    ok(orphans === 0, `${tag} ${orphans} meshes not in any install step`);
-    const minutes = m.installSteps.reduce((a, s) => a + s.minutes, 0);
-    ok(minutes >= d.meta.installMin[0] && minutes <= d.meta.installMin[1], `${tag} install minutes ${minutes} within ${d.meta.installMin}`);
-    ok(m.callouts?.length === 4 && m.callouts.every((c, i) => c.n === i + 1 && c.anchor?.isVector3), `${tag} callouts 1..4 with anchors`);
-    ok(m.gapLabel?.anchor?.isVector3, `${tag} gapLabel`);
-    ok(m.shadeMeshes?.length > 0 && m.shadeMeshes.every((s) => typeof s.userData.transmittance === 'number'), `${tag} shadeMeshes transmittance`);
-    ok(m.topSurfaces?.length > 0, `${tag} topSurfaces`);
-    ok(m.windLoose?.length > 0, `${tag} windLoose`);
-    ok(m.gap && m.gap.y1 > m.gap.y0 && m.gap.x1 > m.gap.x0 && m.gap.z1 > m.gap.z0, `${tag} gap box`);
-    // nothing inside the roof plate footprint below the roof top (allow 2 mm)
-    let pen = 0;
-    const rr = CONTAINER.roofRect;
-    m.group.traverse((o) => {
-      if (!o.isMesh || o.isInstancedMesh) return;
-      const b = new THREE.Box3().setFromObject(o);
-      const inside = b.min.x > rr.x0 + 0.02 && b.max.x < rr.x1 - 0.02 && b.min.z > rr.z0 + 0.02 && b.max.z < rr.z1 - 0.02;
-      if (inside && b.min.y < CONTAINER.roofY - 0.002) pen++;
-    });
-    ok(pen === 0, `${tag} ${pen} meshes penetrate the roof plate`);
-    try { m.update?.(1.0, { windSpeed: 5, windDirDeg: 270 }); } catch (e) { fails++; console.log(`  ✗ ${tag} update threw ${e.message}`); }
-
-    if (which === 'default') {
-      const t0 = performance.now();
-      const prof = analyzer.profile(root, m.shadeMeshes, sunDir, hours);
-      const sky = analyzer.skyView(root, m.shadeMeshes, 128);
-      const tProf = performance.now() - t0;
-      const noon = prof.beamTrans[hours.indexOf(12.5)];
-      const morning = prof.beamTrans[hours.indexOf(7.5)];
-      const shadeProfile = (h) => {
-        const x = h / 0.5, i = Math.min(47, Math.floor(x)), f = x - i;
-        return { beamTrans: prof.beamTrans[i] * (1 - f) + prof.beamTrans[i + 1] * f, skyView: sky };
-      };
-      const th = simulateDay({
-        design: d, params, site, dayOfYear: doy,
-        weather: { Tmax: 35, Tmin: 26, windSpeed: 1.5, clearness: 0.95 },
-        roof: { alpha: 0.7, insulationMm: 50 }, interior: { acOn: true, setpoint: 26, internalGainW: 350 },
-        shadeProfile,
-      });
-      const w = windCheck(d, { V: 26, params });
-      rows.push({ id, tris: tris(m.group), steps: m.installSteps.length, minutes, noon: noon.toFixed(2), '07:30': morning.toFixed(2), sky: sky.toFixed(2), profMs: tProf.toFixed(0),
-        TroofMax: th.summary.TroofMax.toFixed(1), TshadeMax: th.summary.TshadeMax?.toFixed?.(1), roofKWh: th.summary.roofHeatKWh.toFixed(2), acKWh: th.summary.acKWh.toFixed(2),
-        sf26: w.sf.toFixed(2), Vcrit: w.criticalV.toFixed(1), gov: w.governing });
-      ok(tris(m.group) < 60000, `${tag} triangles ${tris(m.group)} < 60k`);
-    }
+let passed = 0;
+let failed = 0;
+function check(cond, msg) {
+  if (cond) passed++;
+  else {
+    failed++;
+    console.error(`FAIL: ${msg}`);
   }
 }
 
-const base = simulateDay({
-  design: getDesign('0'), params: {}, site, dayOfYear: doy,
-  weather: { Tmax: 35, Tmin: 26, windSpeed: 1.5, clearness: 0.95 },
-  roof: { alpha: 0.7, insulationMm: 50 }, interior: { acOn: true, setpoint: 26, internalGainW: 350 },
-});
-rows.unshift({ id: '0', TroofMax: base.summary.TroofMax.toFixed(1), roofKWh: base.summary.roofHeatKWh.toFixed(2), acKWh: base.summary.acKWh.toFixed(2) });
-console.table(rows);
-for (const r of rows.slice(1)) ok(+r.TroofMax < base.summary.TroofMax - 10, `${r.id} roof peak ${r.TroofMax} well below baseline ${base.summary.TroofMax.toFixed(1)}`);
+const mats = createMaterials();
 
-console.log(fails ? `\n${fails} check(s) failed` : '\nall smoke checks passed');
-process.exit(fails ? 1 : 0);
+// 1. Container geometry & toggleable 50mm roof insulation
+const cont = buildContainer({ mats });
+cont.group.updateMatrixWorld(true);
+{
+  const roofBox = new THREE.Box3().setFromObject(cont.roofMesh);
+  const groupBox = new THREE.Box3().setFromObject(cont.group);
+  check(Math.abs(roofBox.max.y - CONTAINER.roofY) < 0.03, `Roof top ~${CONTAINER.roofY}m (got ${roofBox.max.y.toFixed(3)})`);
+  check(Math.abs((roofBox.max.x - roofBox.min.x) - 5.80) < 0.05, `Inner roof plate length ~5.80m (got ${(roofBox.max.x - roofBox.min.x).toFixed(3)})`);
+  check(Math.abs((roofBox.max.z - roofBox.min.z) - 2.80) < 0.05, `Inner roof plate width ~2.80m (got ${(roofBox.max.z - roofBox.min.z).toFixed(3)})`);
+  check((groupBox.max.x - groupBox.min.x) >= CONTAINER.L - 0.01 && (groupBox.max.z - groupBox.min.z) >= CONTAINER.W - 0.01,
+    `Container outer footprint spans >= ${CONTAINER.L}x${CONTAINER.W}m`);
+
+  check(cont.insulationMesh.visible === false, 'Insulation starts hidden at 0mm');
+  cont.setInsulation(50);
+  check(cont.insulationMesh.visible === true, 'setInsulation(50) reveals interior insulation mesh');
+  const insBox = new THREE.Box3().setFromObject(cont.insulationMesh);
+  check(insBox.max.y <= CONTAINER.roofY + 0.001, `Insulation sits below roof steel plate (max.y=${insBox.max.y.toFixed(3)})`);
+  cont.setInsulation(0);
+  check(cont.insulationMesh.visible === false, 'setInsulation(0) hides insulation mesh');
+}
+
+// 2. Design assemblies B, C, Cp
+const builders = { B: buildB, C: buildC, Cp: buildCp };
+const models = Object.fromEntries(DESIGN_IDS.map((id) => [id, builders[id]({ mats })]));
+
+for (const id of DESIGN_IDS) {
+  const m = models[id];
+  m.group.updateMatrixWorld(true);
+
+  const stepRoots = m.installSteps.flatMap((s) => s.objects || []);
+  const stepMeshSets = m.installSteps.map((s) => {
+    const set = new Set();
+    for (const o of s.objects || []) o.traverse((n) => { if (n.isMesh) set.add(n); });
+    return set;
+  });
+
+  // Verify every mesh in m.group belongs to exactly one installStep
+  const allMeshes = [];
+  m.group.traverse((n) => { if (n.isMesh) allMeshes.push(n); });
+  check(allMeshes.length > 0, `${id}: builds meshes (${allMeshes.length})`);
+  const uncovered = allMeshes.filter((mesh) => !stepMeshSets.some((set) => set.has(mesh)));
+  const duplicated = allMeshes.filter((mesh) => stepMeshSets.filter((set) => set.has(mesh)).length > 1);
+  check(uncovered.length === 0, `${id}: all meshes covered by installSteps (uncovered=${uncovered.length})`);
+  check(duplicated.length === 0 && stepRoots.length > 0, `${id}: no mesh duplicated across installSteps`);
+
+  // Verify every mesh has valid non-empty finite vertices (no NaN in CAD/hollow/corrugated geometries)
+  const nanMeshes = allMeshes.filter((mesh) => {
+    const pos = mesh.geometry?.attributes?.position;
+    if (!pos || pos.count === 0) return true;
+    const arr = pos.array;
+    for (let i = 0; i < arr.length; i++) if (!Number.isFinite(arr[i])) return true;
+    return false;
+  });
+  check(nanMeshes.length === 0, `${id}: all ${allMeshes.length} meshes have finite non-empty vertices`);
+
+  // Verify panel/support meshes do not pierce interior (y < 2.79 within roof footprint)
+  const nonExteriorKeys = new Set(['acp', 'panel', 'crossbar', 'leveler', 'pad', 'latch', 'wingbolt']);
+  const intruding = [];
+  for (const part of m.parts || []) {
+    if (!nonExteriorKeys.has(part.key)) continue;
+    for (const o of part.objects || []) {
+      const b = new THREE.Box3().setFromObject(o);
+      if (b.min.y < CONTAINER.roofY - 0.015 && Math.abs((b.min.x + b.max.x) / 2) < 2.95 && Math.abs((b.min.z + b.max.z) / 2) < 1.48) {
+        intruding.push(`${part.key}(${b.min.y.toFixed(3)})`);
+      }
+    }
+  }
+  check(intruding.length === 0, `${id}: zero roof-assembly penetration into container interior (${intruding.join(', ')})`);
+}
+
+// Specific checks for B (0mm contact)
+{
+  const mB = models.B;
+  check(mB.gap === null, 'B: gap is null (0mm direct contact)');
+  check(mB.callouts.length === 3, 'B: 3 callouts');
+  check(mB.installSteps.length === 1, 'B: 1 install step');
+  const boxB = new THREE.Box3().setFromObject(mB.group);
+  check(boxB.min.y >= CONTAINER.roofY - 0.005 && boxB.max.y <= 2.83, `B panels flush on roof (${boxB.min.y.toFixed(3)}..${boxB.max.y.toFixed(3)})`);
+  check(mB.topSurfaces.length === 12, `B: 12 ACP topSurfaces (${mB.topSurfaces.length})`);
+}
+
+// Specific checks for C (110mm) and Cp (140mm): straps, channels, callouts, install steps
+for (const id of INSTALL_IDS) {
+  const m = models[id];
+  check(m.callouts.length === 4, `${id}: 4 callouts`);
+  check(m.installSteps.length >= 5, `${id}: >= 5 installSteps (${m.installSteps.length})`);
+  check(m.gap && m.gap.flowAxis === 'z' && Array.isArray(m.gap.channels) && m.gap.channels.length === 4, `${id}: 4 widthwise Z channels`);
+
+  const interiorCrossbarsX = [-1.5, 0, 1.5];
+  for (let ci = 0; ci < m.gap.channels.length; ci++) {
+    const ch = m.gap.channels[ci];
+    check(ch.y0 >= CONTAINER.roofY && ch.y1 <= m.gap.y1 + 1e-6, `${id} ch[${ci}] y strictly inside air gap`);
+    for (const cx of interiorCrossbarsX) {
+      check(cx <= ch.x0 || cx >= ch.x1, `${id} ch[${ci}] [${ch.x0.toFixed(2)}, ${ch.x1.toFixed(2)}] never crosses crossbar at x=${cx}`);
+    }
+  }
+
+  const strapPart = m.parts.find((p) => p.key === 'strap');
+  check(!!strapPart && strapPart.objects.length > 0, `${id}: strap part exists`);
+  const strapBox = new THREE.Box3();
+  for (const o of strapPart.objects) strapBox.expandByObject(o);
+  check(strapBox.max.y < m.gap.y1, `${id}: ratchet straps stay below panel top (${strapBox.max.y.toFixed(3)} < ${m.gap.y1.toFixed(3)})`);
+}
+
+// 3. Animator: install -> disassemble -> restore
+{
+  const anim = createAnimator();
+  const mC = models.C;
+  const seenInst = new Set();
+  let doneInst = false;
+  anim.playInstall(mC, { speed: 4, onStep: (i) => seenInst.add(i), onDone: () => { doneInst = true; } });
+  for (let i = 0; i < 1500 && anim.isAnimating(mC); i++) anim.update(0.05);
+  check(doneInst && seenInst.size === mC.installSteps.length, `Install animation visited all ${mC.installSteps.length} steps (visited=${seenInst.size})`);
+  check(mC.installSteps.every((s) => s.objects.every((o) => o.visible === true)), 'Install ends with all parts visible');
+
+  const seenDis = new Set();
+  let doneDis = false;
+  anim.playDisassemble(mC, { speed: 4, onStep: (i) => seenDis.add(i), onDone: () => { doneDis = true; } });
+  for (let i = 0; i < 1500 && anim.isAnimating(mC); i++) anim.update(0.05);
+  check(doneDis && seenDis.size === mC.installSteps.length, `Disassemble animation visited all ${mC.installSteps.length} steps (visited=${seenDis.size})`);
+  check(mC.installSteps.every((s) => s.objects.every((o) => o.visible === false)), 'Disassemble ends with parts removed/hidden');
+
+  anim.restoreAssembled(mC);
+  check(mC.installSteps.every((s) => s.objects.every((o) => o.visible === true)), 'restoreAssembled restores all parts visible');
+}
+
+// 4. Visualization modules: shade, flow, heatmap, rays
+{
+  const unitGroup = new THREE.Group();
+  unitGroup.add(cont.group, models.C.group);
+  unitGroup.updateMatrixWorld(true);
+
+  const shade = createShadeAnalyzer();
+  const sunDir = new THREE.Vector3(0.2, 0.95, 0.2).normalize();
+  const trans = shade.meanTransmittance(unitGroup, models.C.shadeMeshes, sunDir);
+  check(trans < 0.05, `100% opaque C roof shields underlying roof plate (transmittance=${trans.toFixed(4)})`);
+
+  const flow = createGapFlow();
+  flow.setVisible(false);
+  check(flow.object.visible === false, 'flow.setVisible(false) hides particle cloud');
+  flow.setVisible(true);
+  flow.setGap(models.C.gap);
+  flow.update(0.1, { gapVelocity: 0.5, windSpeed: 1.5, Tin: 34, Tout: 40 });
+  const posArr = flow.object.geometry.attributes.position.array;
+  const count = flow.object.geometry.attributes.position.count;
+  let outOfBounds = 0;
+  for (let i = 0; i < count; i++) {
+    const x = posArr[i * 3], y = posArr[i * 3 + 1];
+    const inAnyChannel = models.C.gap.channels.some((ch) => x >= ch.x0 - 0.001 && x <= ch.x1 + 0.001);
+    if (!inAnyChannel || y < CONTAINER.roofY - 0.001 || y > models.C.gap.y1 + 0.001) outOfBounds++;
+  }
+  check(outOfBounds === 0, `All ${count} flow particles stay inside 4 channels & air gap height (oob=${outOfBounds})`);
+
+  const rgb = [0, 0, 0];
+  tempToRGB(25, rgb, 0);
+  check(rgb.every((c) => Number.isFinite(c) && c >= 0 && c <= 1), 'tempToRGB writes valid linear RGB');
+
+  const hm = createRoofHeatmap();
+  hm.update(null, 65, 35);
+  check(hm.temps[0] > 60 && hm.mesh.visible === true, 'Heatmap updates cell temperatures');
+
+  const rays = createSunRays();
+  rays.update(sunDir, unitGroup, models.C.topSurfaces, 70);
+  check(rays.group.visible === true, 'SunRays updates cleanly');
+}
+
+console.log(failed ? `\n${failed} check(s) failed (${passed} passed)` : `\nall smoke checks passed (${passed})`);
+assert.equal(failed, 0);

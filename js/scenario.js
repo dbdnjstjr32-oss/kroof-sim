@@ -1,14 +1,8 @@
-// scenario.js — snapshot / validate / share / save the user's settings. Pure JS (no DOM, no three.js).
-//
-// A "snapshot" is the subset of app state worth sharing (inputs, not view toggles or animation triggers).
-// Everything that comes from outside (a pasted link, localStorage) goes through sanitize(), which drops
-// unknown keys and clamps every number to CUSTOM_SPEC / the design's own parameter ranges, so a hand-edited
-// link can never push the physics outside the ranges the sliders allow.
-import { CUSTOM_SPEC, DESIGNS, DESIGN_IDS, ALL_IDS, SITES, WEATHER_PRESETS, UNDERSIDE_OPTIONS } from './config.js';
+// scenario.js — snapshot / validate / share / save user simulation settings. Pure JS (no DOM, no three.js).
+import { CUSTOM_SPEC, ALL_IDS, SITES, WEATHER_PRESETS, INSULATION_OPTIONS } from './config.js';
 
 export const SHARED_KEYS = [
   'mode', 'design', 'siteId', 'customSite', 'month', 'day', 'hour', 'weatherPreset', 'weather', 'roof', 'interior',
-  'gust', 'windDirDeg', 'windAdj', 'params', 'surface', 'econ',
 ];
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -29,8 +23,8 @@ function clampSpec(path, v) {
 }
 
 /**
- * Validate an untrusted partial snapshot. Returns only well-formed values (possibly {}), never throws.
- * Integers (month/day) are rounded; day is limited to the month length.
+ * Validate an untrusted partial snapshot. Returns only well-formed values, never throws.
+ * Enforces Tmin <= Tmax (§8.1) and insulationMm in {0, 50} (§3.4).
  */
 export function sanitize(raw) {
   const out = {};
@@ -49,7 +43,7 @@ export function sanitize(raw) {
   if (ALL_IDS.includes(raw.design)) out.design = raw.design;
   if (raw.siteId === 'custom' || SITES.some((s) => s.id === raw.siteId)) out.siteId = raw.siteId;
   if (raw.weatherPreset === 'custom' || WEATHER_PRESETS.some((p) => p.id === raw.weatherPreset)) out.weatherPreset = raw.weatherPreset;
-  for (const k of ['hour', 'gust', 'windDirDeg']) num(k, raw[k]);
+  num('hour', raw.hour);
   if (isNum(raw.month)) put('month', Math.round(clampSpec('month', raw.month)));
   if (isNum(raw.day)) {
     const m = isNum(raw.month) ? Math.round(clampSpec('month', raw.month)) : null;
@@ -57,24 +51,17 @@ export function sanitize(raw) {
     put('day', Math.min(maxDay, Math.round(clampSpec('day', raw.day))));
   }
   group('weather', ['Tmax', 'Tmin', 'windSpeed', 'clearness']);
-  group('roof', ['alpha', 'eps', 'insulationMm']);
-  group('interior', ['setpoint', 'internalGainW', 'wallU', 'windowArea', 'achInfil', 'acCOP']);
-  if (isObj(raw.interior) && typeof raw.interior.acOn === 'boolean') put('interior.acOn', raw.interior.acOn);
-  group('windAdj', ['capScale', 'cpScale']);
-  group('customSite', ['lat', 'lon', 'tz']);
-  group('surface', ['topAlpha', 'foilEps']);
-  if (isObj(raw.surface) && UNDERSIDE_OPTIONS.includes(raw.surface.underside)) put('surface.underside', raw.surface.underside);
-  group('econ', ['price', 'days']);
-  if (isObj(raw.econ?.cost)) for (const id of DESIGN_IDS) num(`econ.cost.${id}`, raw.econ.cost[id]);
-  if (isObj(raw.params)) {
-    for (const id of DESIGN_IDS) {
-      const src = raw.params[id];
-      if (!isObj(src)) continue;
-      for (const [key, sp] of Object.entries(DESIGNS[id].params || {})) {
-        if (isNum(src[key])) put(`params.${id}.${key}`, Math.min(sp.max, Math.max(sp.min, src[key])));
-      }
-    }
+  if (out.weather && isNum(out.weather.Tmax) && isNum(out.weather.Tmin) && out.weather.Tmin > out.weather.Tmax) {
+    out.weather.Tmin = out.weather.Tmax;
   }
+  if (isObj(raw.roof) && isNum(raw.roof.insulationMm)) {
+    const v = raw.roof.insulationMm;
+    const nearest = INSULATION_OPTIONS.reduce((a, b) => (Math.abs(b - v) < Math.abs(a - v) ? b : a));
+    put('roof.insulationMm', nearest);
+  }
+  group('interior', ['setpoint']);
+  if (isObj(raw.interior) && typeof raw.interior.acOn === 'boolean') put('interior.acOn', raw.interior.acOn);
+  group('customSite', ['lat', 'lon', 'tz']);
   return out;
 }
 
@@ -113,7 +100,6 @@ export function encodeShare(snap, defaults) {
   return toB64Url(JSON.stringify(diff(snap, defaults || {})));
 }
 
-/** Returns a sanitised partial snapshot, or null if the hash holds no (valid) scenario. */
 export function decodeShare(hashOrCode) {
   try {
     const m = /(?:^#?|[#&])s=([A-Za-z0-9_-]+)/.exec(String(hashOrCode || ''));
@@ -129,8 +115,8 @@ export function shareUrl(baseUrl, snap, defaults) {
   return `${base}#s=${encodeShare(snap, defaults)}`;
 }
 
-// ---- named slots in a Storage-like object ({getItem,setItem}); failures are swallowed (private mode etc.)
-export function createSlotStore(storage, { key = 'kroof.scenarios', max = 12 } = {}) {
+// ---- named slots in localStorage
+export function createSlotStore(storage, { key = 'kroof.scenarios.v2', max = 12 } = {}) {
   const read = () => {
     try {
       const v = JSON.parse(storage?.getItem(key) || '[]');

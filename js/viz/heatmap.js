@@ -92,7 +92,7 @@ export function tempToRGB(T, out, offset = 0, min = TEMP_RANGE[0], max = TEMP_RA
  * `trans` may be null (→ fully sunlit). Colours are smoothed bilinearly through a vertex grid.
  */
 export function createRoofHeatmap({ nx = 24, nz = 12 } = {}) {
-  const R = CONTAINER.roofRect;
+  const R = CONTAINER.innerRoofRect || CONTAINER.roofRect;
   const w = R.x1 - R.x0, d = R.z1 - R.z0;
 
   // PlaneGeometry rotated flat: vertex (ix, iz) → index iz*(nx+1)+ix, x increasing with ix, z with iz.
@@ -116,7 +116,7 @@ export function createRoofHeatmap({ nx = 24, nz = 12 } = {}) {
 
   const mesh = new THREE.Mesh(geometry, material);
   mesh.name = 'roofHeatmap';
-  mesh.position.set((R.x0 + R.x1) / 2, R.y + 0.004, (R.z0 + R.z1) / 2);
+  mesh.position.set((R.x0 + R.x1) / 2, R.y + 0.0025, (R.z0 + R.z1) / 2);
   mesh.castShadow = false;
   mesh.receiveShadow = false;
   mesh.renderOrder = 2;

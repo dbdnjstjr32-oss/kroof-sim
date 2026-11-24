@@ -200,7 +200,8 @@ export function createSunRays() {
         outB.add(G(H, A), G(B.copy(H).addScaledVector(R, MIRROR_LEN), B), 0.013);
       } else {
         // diffuse fan in the plane of incidence: normal ±40°
-        const batch = albedo(mat) > 0.45 ? outB : dimB;
+        const isBareRoof = hitObj && hitObj.name === 'roofPlate';
+        const batch = !isBareRoof && albedo(mat) > 0.45 ? outB : dimB;
         T.copy(sun).addScaledVector(N, -sun.dot(N));
         if (T.lengthSq() < 1e-8) T.set(1, 0, 0).addScaledVector(N, -N.x);
         T.normalize();

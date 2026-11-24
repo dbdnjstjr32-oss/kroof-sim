@@ -4,8 +4,8 @@
 const FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='7' fill='%23e69f00'/%3E%3Cg stroke='%23e69f00' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M16 2v4M16 26v4M2 16h4M26 16h4M6 6l3 3M23 23l3 3M6 26l3-3M23 9l3-3'/%3E%3C/g%3E%3C/svg%3E";
 
 export const META = {
-  title: 'K-Roof 차열 시뮬레이터',
-  description: '컨테이너 휴게실 지붕 차열 설계안 A–E의 3D 시뮬레이션 — 태양 위치, 지붕 열지도, 24시간 온도, 풍하중 안전율, 설치·분해·이탈 애니메이션.',
+  title: 'OASIS 컨테이너 차열 지붕 시뮬레이터 (A·B·C·C′안)',
+  description: '6m × 3m × 2.8m 건설현장 컨테이너 휴게실 차열 지붕 설계안 A·B·C·C′ 비교 3D 시뮬레이션 — 태양 위치, 공기층 자연환기, 24시간 강판·실내온도 그래프, 냉방부하·절감률 비교 및 설치·해체 애니메이션.',
 };
 
 export function wrap(body, { social = false } = {}) {
