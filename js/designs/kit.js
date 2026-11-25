@@ -279,11 +279,21 @@ export function buildCrossbarStrap(kit, mats, { x, zSide, yBarTop, yBarBot, cros
   return mergeByMaterial(raw, 'ratchetStrap');
 }
 
-export function finishModel({ id, group, parts, installSteps, anchors, gap, topSurfaces, windLoose, gapBox = null }) {
+/**
+ * Optional extras (B안 천공 고정):
+ *   disassembleSteps — custom teardown [{ title, minutes, objects, reveal, holdSec }] (see animator.js)
+ *   notices          — 3D warning labels [{ text, sub, anchor, showWith, tone }] shown while `showWith` is visible
+ *   update(t)        — per-frame animation; extra — merged into the model (e.g. fastener metadata)
+ * Meshes flagged `userData.noShade` (tiny fasteners, roof marks) are left out of the sun-shading ray casts.
+ */
+export function finishModel({
+  id, group, parts, installSteps, anchors, gap, topSurfaces, windLoose, gapBox = null,
+  disassembleSteps = null, notices = null, update = null, extra = null,
+}) {
   const d = DESIGNS[id];
   const shadeMeshes = [];
   group.traverse((o) => {
-    if (o.isMesh) {
+    if (o.isMesh && !o.userData.noShade) {
       o.userData.transmittance = 0;
       shadeMeshes.push(o);
     }
@@ -304,6 +314,9 @@ export function finishModel({ id, group, parts, installSteps, anchors, gap, topS
     topSurfaces,
     gap: resolvedGap,
     windLoose: windLoose || topSurfaces,
-    update: () => {},
+    disassembleSteps: Array.isArray(disassembleSteps) && disassembleSteps.length ? disassembleSteps : null,
+    notices: Array.isArray(notices) ? notices : [],
+    update: typeof update === 'function' ? update : () => {},
+    ...(extra || {}),
   };
 }

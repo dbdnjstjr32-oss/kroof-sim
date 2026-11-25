@@ -1,7 +1,10 @@
 // Custom material lock & scenario persistence test suite
 import { strict as assert } from 'node:assert';
-import { SITES, WEATHER_PRESETS, ROOF, INTERIOR, ALL_IDS, INSULATION_OPTIONS, customDefaults, getDesign } from '../js/config.js';
-import { effectiveDesign, surfaceGray, applySurfaceAppearance } from '../js/custom.js';
+import {
+  SITES, WEATHER_PRESETS, ROOF, INTERIOR, ALL_IDS, INSULATION_OPTIONS, customDefaults, getDesign,
+  CP_CANDIDATES, CP_SURFACE_DEFAULT, cpSurfaceOf, isCpAdjusted, cpCandidateOf, cpSurfaceTexts,
+} from '../js/config.js';
+import { effectiveDesign, cpDesignFor, surfaceGray, applySurfaceAppearance } from '../js/custom.js';
 import {
   SHARED_KEYS,
   snapshot,
@@ -42,6 +45,36 @@ function check(cond, msg) {
   passed++;
 }
 
+// 1b. C′ surface-property sensitivity (추가 수정 요청 §2)
+{
+  const base = getDesign('Cp');
+  check(CP_SURFACE_DEFAULT.rhoSolar === 0.75 && CP_SURFACE_DEFAULT.epsBottom === 0.28, 'C′ default surface ρ 0.75 / ε 0.28');
+  check(base.thermal.rhoSolar === 0.75 && base.thermal.alphaTop === 0.25 && base.thermal.epsBottom === 0.28 && base.thermal.epsTop === 0.88,
+    'C′ base thermal properties unchanged');
+  const expect = [['base', 0.75, 0.28], ['c1', 0.85, 0.28], ['c2', 0.89, 0.28], ['c3', 0.75, 0.20], ['c4', 0.75, 0.12], ['c5', 0.85, 0.20], ['c6', 0.89, 0.12]];
+  check(CP_CANDIDATES.length === 7 && expect.every(([id, r, e], i) => CP_CANDIDATES[i].id === id && CP_CANDIDATES[i].rhoSolar === r && CP_CANDIDATES[i].epsBottom === e),
+    'C′ candidates match the request document (기존 + 후보 1~6)');
+
+  const adj = effectiveDesign('Cp', { cpSurface: { rhoSolar: 0.85, epsBottom: 0.20 } });
+  check(adj !== base && adj.thermal.rhoSolar === 0.85 && adj.thermal.alphaTop === 0.15 && adj.thermal.epsBottom === 0.20,
+    'adjusted C′: ρ 0.85 → α 0.15 (= 1 − ρ), ε_bottom 0.20');
+  const keep = ['mode', 'gap', 'channels', 'thickness', 'k', 'rho', 'cp', 'arealMass', 'arealHeatCap', 'epsTop', 'coverFactor'];
+  check(keep.every((k) => adj.thermal[k] === base.thermal[k]), 'adjusted C′ keeps ε_top 0.88, galvalume 0.5T properties and the 140 mm gap');
+  check(adj.specs.topFinish === '백색 차열도료 (ρ=0.85, α=0.15)' && adj.specs.botFinish === '무도장 갈바륨 (ε=0.20)', 'adjusted C′ spec texts follow the values');
+  check(adj.callouts[0].sub.includes('ρ=0.85') && adj.callouts[0].sub.includes('ε=0.20') && adj.surfaceAdjusted === true, 'adjusted C′ callout 1 follows the values');
+  check(base.specs.topFinish === cpSurfaceTexts(CP_SURFACE_DEFAULT).topFinish, 'base C′ spec text generated from the same formatter');
+  check(effectiveDesign('Cp', { cpSurface: { ...CP_SURFACE_DEFAULT } }) === base, 'default surface returns the spec design itself');
+  for (const id of ['A', 'B', 'C']) check(effectiveDesign(id, { cpSurface: { rhoSolar: 0.9, epsBottom: 0.1 } }) === getDesign(id), `${id}: unaffected by C′ surface controls`);
+
+  const clamped = cpSurfaceOf({ cpSurface: { rhoSolar: 2, epsBottom: -1 } });
+  check(clamped.rhoSolar === 0.95 && clamped.epsBottom === 0.05, 'cpSurfaceOf clamps to 0.50–0.95 / 0.05–0.90');
+  check(cpSurfaceOf({}).rhoSolar === 0.75 && cpSurfaceOf(null).epsBottom === 0.28, 'cpSurfaceOf falls back to the base values');
+  check(cpDesignFor({ rhoSolar: 0.3 }).thermal.rhoSolar === 0.5 && cpDesignFor({ rhoSolar: 0.3 }).thermal.epsBottom === 0.28, 'cpDesignFor clamps and fills missing values');
+  check(cpCandidateOf({ rhoSolar: 0.85, epsBottom: 0.28 })?.id === 'c1' && cpCandidateOf({ rhoSolar: 0.8, epsBottom: 0.28 }) === null, 'cpCandidateOf matches candidates only');
+  check(!isCpAdjusted({ cpSurface: { ...CP_SURFACE_DEFAULT } }) && isCpAdjusted({ cpSurface: { rhoSolar: 0.89, epsBottom: 0.12 } }), 'isCpAdjusted');
+  check(customDefaults().cpSurface.rhoSolar === 0.75 && customDefaults().cpSurface.epsBottom === 0.28, 'customDefaults seeds the C′ surface');
+}
+
 // 2. sanitize enforces Tmin <= Tmax, {0,50} insulation snapping, and parameter bounds
 {
   const s1 = sanitize({
@@ -69,6 +102,10 @@ function check(cond, msg) {
 
   const s0 = sanitize({ roof: { insulationMm: 20 } });
   check(s0.roof.insulationMm === 0 && INSULATION_OPTIONS.includes(0) && INSULATION_OPTIONS.includes(50), 'insulation 20 snaps to 0');
+
+  const sCp = sanitize({ cpSurface: { rhoSolar: 0.99, epsBottom: 0.2, extra: 1 } });
+  check(sCp.cpSurface.rhoSolar === 0.95 && sCp.cpSurface.epsBottom === 0.2 && sCp.cpSurface.extra === undefined, 'cpSurface sanitized (clamped, unknown keys dropped)');
+  check(sanitize({ cpSurface: { rhoSolar: 'x' } }).cpSurface === undefined, 'non-numeric cpSurface discarded');
 
   const invalid = sanitize({ mode: 'bogus', design: 'E', siteId: 'mars', weatherPreset: 'hail', interior: { acOn: 'yes' } });
   check(Object.keys(invalid).length === 0, 'invalid enum/type values discarded cleanly');
@@ -102,10 +139,15 @@ function check(cond, msg) {
   check(d.design === 'Cp' && d.roof.insulationMm === 50 && d.interior.acOn === true && d.weather.Tmax === 38, 'diff captures only modified leaves');
   check(d.siteId === undefined && d.weather.Tmin === undefined, 'diff omits unchanged leaves');
 
+  check(SHARED_KEYS.includes('cpSurface') && edited.cpSurface?.rhoSolar === 0.75, 'snapshot carries the C′ surface');
+  edited.cpSurface.rhoSolar = 0.89;
+  edited.cpSurface.epsBottom = 0.12;
+
   const url = shareUrl('https://example.test/kroof/#old', edited, defaults);
   check(url.startsWith('https://example.test/kroof/#s='), 'shareUrl strips old hash and writes #s=');
   const decoded = decodeShare(url.split('#')[1]);
   check(decoded?.design === 'Cp' && decoded?.roof?.insulationMm === 50 && decoded?.interior?.acOn === true, 'decodeShare restores sanitized changes');
+  check(decoded?.cpSurface?.rhoSolar === 0.89 && decoded?.cpSurface?.epsBottom === 0.12, 'share link round-trips the C′ surface (후보 6)');
 
   const merged = deepMerge(snapshot(defaults), decoded);
   check(merged.design === 'Cp' && merged.roof.insulationMm === 50 && merged.weather.Tmin === 26, 'deepMerge preserves untouched defaults');

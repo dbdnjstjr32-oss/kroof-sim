@@ -7,8 +7,9 @@ import * as config from './config.js';
 import {
   DESIGN_IDS, ALL_IDS, SITES, WEATHER_PRESETS, COMPARE_LAYOUT, TEMP_RANGE,
   ROOF, INTERIOR, getDesign, customDefaults, displayId,
+  CP_CANDIDATES, cpSurfaceOf, isCpAdjusted,
 } from './config.js';
-import { effectiveDesign } from './custom.js';
+import { effectiveDesign, cpDesignFor } from './custom.js';
 import { snapshot, sanitize, deepMerge, decodeShare, shareUrl, createSlotStore } from './scenario.js';
 import { createMaterials } from './materials.js';
 import { disposeTree } from './parts.js';
@@ -23,7 +24,7 @@ import { createShadeAnalyzer } from './viz/shade.js';
 import { createRoofHeatmap, HEAT_CSS_GRADIENT } from './viz/heatmap.js';
 import { createGapFlow } from './viz/flow.js';
 import { createSunRays } from './viz/rays.js';
-import { createAnimator } from './viz/animator.js';
+import { createAnimator, disassemblySequence } from './viz/animator.js';
 import { createUI } from './ui/ui.js';
 
 const BUILDERS = { B: buildB, C: buildC, Cp: buildCp };
@@ -209,7 +210,31 @@ function rebuildLabels(unit) {
     unit.root.add(obj);
     unit.labels.push(obj);
   }
+  // Warning labels that only appear with their reveal object (B안: drill holes / repair needed after teardown)
+  for (const nt of m.notices || []) {
+    const el = document.createElement('div');
+    el.className = `notice-label${nt.tone ? ` is-${nt.tone}` : ''}`;
+    const t = document.createElement('span'); t.className = 't'; t.textContent = nt.text; el.append(t);
+    if (nt.sub) { const s = document.createElement('span'); s.className = 's'; s.textContent = nt.sub; el.append(s); }
+    const obj = new CSS2DObject(el);
+    obj.position.copy(nt.anchor);
+    obj.userData.showWith = nt.showWith || null;
+    unit.root.add(obj);
+    unit.labels.push(obj);
+  }
   refreshLabelVisibility();
+}
+
+/** C′ callouts follow the adjustable surface properties (ρ, ε) shown in the labels. */
+function refreshCpCallouts() {
+  const unit = units.Cp;
+  if (!unit?.model) return;
+  const eff = effectiveDesign('Cp', state);
+  for (const c of unit.model.callouts) {
+    const e = eff.callouts.find((x) => x.n === c.n);
+    if (e) { c.text = e.text; c.sub = e.sub; }
+  }
+  rebuildLabels(unit);
 }
 
 function declutterLabels() {
@@ -228,8 +253,26 @@ function declutterLabels() {
 function refreshLabelVisibility() {
   for (const u of Object.values(units)) {
     const show = state.view.labels && u.root.visible && (state.mode === 'single' ? u.id === state.design : false);
-    for (const l of u.labels) l.visible = show;
+    for (const l of u.labels) l.visible = show && (!l.userData.showWith || l.userData.showWith.visible);
     u.tagLabel.visible = u.root.visible && state.mode === 'compare';
+  }
+}
+
+// Notice labels track their reveal objects, which the animator toggles during a teardown; B's heat-map follows its panels.
+function syncNotices() {
+  const uB = units.B;
+  if (uB) {
+    const want = state.view.heatmap && uB.root.visible && !!results.thermal.B && !roofCovered(uB);
+    if (uB.heatmap.mesh.visible !== want) uB.heatmap.setVisible(want);
+  }
+  for (const u of Object.values(units)) {
+    const show = state.view.labels && u.root.visible && state.mode === 'single' && u.id === state.design;
+    for (const l of u.labels) {
+      const w = l.userData.showWith;
+      if (!w) continue;
+      const want = show && w.visible;
+      if (l.visible !== want) l.visible = want;
+    }
   }
 }
 
@@ -265,9 +308,13 @@ function applySection() {
   leaderMat.clippingPlanes = [];
 }
 
+// B's panels lie flush on the roof: the roof heat-map overlay would bleed through them (polygon offset) and
+// veil the white ACP and the screw heads, so it is only shown while the B roof is uncovered (mid-install / torn down).
+const roofCovered = (u) => u.id === 'B' && !!u.model && u.model.topSurfaces.some((o) => isShown(o));
+
 function applyOverlayVisibility() {
   for (const u of Object.values(units)) {
-    u.heatmap.setVisible(state.view.heatmap && u.root.visible && !!results.thermal[u.id]);
+    u.heatmap.setVisible(state.view.heatmap && u.root.visible && !!results.thermal[u.id] && !roofCovered(u));
     // B안 has 0 mm air gap: never display air-gap airflow particles inside B
     const hasAirFlow = u.id !== 'B';
     u.flow.setVisible(state.view.flow && u.root.visible && hasAirFlow);
@@ -283,11 +330,17 @@ const CAMS = {
   top:     { pos: [0, 16, 0.6],   target: [0, 2.8, 0], fov: 42 },
   gap:     { pos: [4.8, 3.2, 3.4], target: [1.0, 2.88, 0], fov: 40 },
   detail:  { pos: [3.62, 2.98, 2.32], target: [2.88, 2.74, 1.48], fov: 34 },
+  roof:    { pos: [4.4, 4.7, 3.9], target: [0.7, 2.78, 0.25], fov: 40 },   // whole roof surface, close enough for screws/holes
   yard:    { pos: [17, 13, 21],   target: [0, 1.6, 0], fov: 42 },
 };
+// Design-specific presets: B's "상세" looks at the SE roof corner screws + EPDM washers instead of a strap.
+const CAMS_BY_DESIGN = {
+  B: { detail: { pos: [3.36, 3.06, 1.98], target: [2.72, 2.80, 1.28], fov: 30 } },
+};
+const camPreset = (name) => CAMS_BY_DESIGN[state.design]?.[name] || CAMS[name] || CAMS.iso;
 let camTween = null;
 function flyTo(name) {
-  const c = CAMS[name] || CAMS.iso;
+  const c = camPreset(name);
   const off = state.mode === 'compare' && name !== 'yard' ? COMPARE_LAYOUT[state.design] : { x: 0, z: 0 };
   camTween = {
     t: 0, dur: 0.9,
@@ -325,20 +378,66 @@ function updateSunPath() {
 }
 
 // ------------------------------------------------------------------ physics
-const results = { thermal: {} };
+// thermal: {A, B, C, Cp} (Cp with the current, possibly adjusted, surface properties)
+// cpBase: original C′ under the same conditions · cpCandidates: the 2-3 candidate conditions (computed in the background)
+const results = { thermal: {}, cpBase: null, cpCandidates: {}, cpSurface: cpSurfaceOf(state), cpAdjusted: false };
+
+function thermalOpts(design) {
+  const s = site();
+  return {
+    design,
+    site: { lat: s.lat, lon: s.lon, tz: s.tz },
+    dayOfYear: doy(),
+    weather: { ...state.weather },
+    roof: { ...state.roof },
+    interior: { ...state.interior },
+  };
+}
+
+// C′ reference runs depend only on the shared conditions, not on the C′ sliders → cache per condition set.
+const cpCache = { key: '', base: null, cand: {} };
+let candTimer = 0;
+const conditionKey = () => JSON.stringify([site(), doy(), state.weather, state.roof, state.interior]);
+
+function publishCp() {
+  results.cpSurface = cpSurfaceOf(state);
+  results.cpAdjusted = isCpAdjusted(state);
+  results.cpBase = cpCache.base;
+  results.cpCandidates = cpCache.base ? { base: cpCache.base, ...cpCache.cand } : { ...cpCache.cand };
+}
 
 function runThermal(ids = ALL_IDS) {
-  const s = site();
-  for (const id of ids) {
-    results.thermal[id] = simulatePair({
-      design: effectiveDesign(id, state),
-      site: { lat: s.lat, lon: s.lon, tz: s.tz },
-      dayOfYear: doy(),
-      weather: { ...state.weather },
-      roof: { ...state.roof },
-      interior: { ...state.interior },
-    });
-  }
+  const key = conditionKey();
+  if (key !== cpCache.key) { cpCache.key = key; cpCache.base = null; cpCache.cand = {}; }
+  for (const id of ids) results.thermal[id] = simulatePair(thermalOpts(effectiveDesign(id, state)));
+  if (!isCpAdjusted(state)) { if (ids.includes('Cp') && results.thermal.Cp) cpCache.base = results.thermal.Cp; }
+  else if (!cpCache.base) cpCache.base = simulatePair(thermalOpts(getDesign('Cp')));
+  publishCp();
+  scheduleCandidates();
+}
+
+// One candidate per tick so slider drags and the 3D view stay smooth (~8 ms per candidate pair).
+function scheduleCandidates() {
+  clearTimeout(candTimer);
+  const key = cpCache.key;
+  let computed = 0;
+  const step = () => {
+    if (key !== cpCache.key) return;
+    const next = CP_CANDIDATES.find((c) => c.id !== 'base' && !cpCache.cand[c.id]);
+    if (!next) {
+      if (computed) { publishCp(); ui?.renderResults?.({ ...results }); }
+      return;
+    }
+    try {
+      cpCache.cand[next.id] = simulatePair(thermalOpts(cpDesignFor(next)));
+      computed++;
+    } catch (e) {
+      console.error(e);
+      return;
+    }
+    candTimer = setTimeout(step, 0);
+  };
+  candTimer = setTimeout(step, 30);
 }
 
 const dirty = { thermal: new Set(), sunPath: false };
@@ -387,6 +486,11 @@ function set(patch) {
   if (changed((s) => [s.weather, s.roof, s.interior])) {
     ALL_IDS.forEach((id) => dirty.thermal.add(id)); heavy = true; hourDirty = true;
   }
+  if (changed((s) => s.cpSurface)) {
+    state.cpSurface = cpSurfaceOf(state);
+    dirty.thermal.add('Cp'); heavy = true; hourDirty = true;
+    refreshCpCallouts();
+  }
   if (changed((s) => s.roof.insulationMm)) {
     for (const u of Object.values(units)) u.container.setInsulation(state.roof.insulationMm);
   }
@@ -399,6 +503,7 @@ function set(patch) {
     pushInstallSteps();
     if (changed((s) => s.mode)) flyTo(state.mode === 'compare' ? 'yard' : state.camera === 'yard' ? 'iso' : state.camera);
     else if (state.mode === 'compare') flyTo(state.camera === 'yard' ? 'yard' : state.camera);
+    else if (state.camera === 'detail' || state.camera === 'roof') flyTo(state.camera);   // design-specific presets
     ui?.renderResults?.({ ...results });
   }
   if (changed((s) => s.view.section)) applySection();
@@ -431,6 +536,19 @@ function pushInstallSteps() {
   ui?.setInstall?.({ running: false, mode: 'install', stepIndex: -1, steps, elapsedMin: 0, totalMin: steps.reduce((a, s) => a + s.minutes, 0) });
 }
 
+function switchCamera(name) {
+  if (state.camera === name) return;
+  if (state.camera === 'section' && state.view.section) { state.view.section = false; applySection(); }
+  state.camera = name;
+  flyTo(name);
+}
+
+// B's screws and drill holes are only legible close to the roof; C/C′ read fine from the iso view.
+function cameraForSequence(m) {
+  if (m.id === 'B') { if (state.camera !== 'roof' && state.camera !== 'detail') switchCamera('roof'); }
+  else if (state.camera !== 'iso' && state.camera !== 'gap') switchCamera('iso');
+}
+
 function startInstall() {
   const m = selectedUnit().model;
   if (!m) { ui?.toast?.('A안은 추가 차열 구조물이 없습니다. B, C, C′안을 선택하세요.'); return; }
@@ -442,30 +560,33 @@ function startInstall() {
     onStep: (i, step, elapsedMin) => { ui?.setInstall?.({ running: true, mode: 'install', stepIndex: i, steps, elapsedMin, totalMin }); hourDirty = true; },
     onDone: () => { ui?.setInstall?.({ running: false, mode: 'install', stepIndex: steps.length, steps, elapsedMin: totalMin, totalMin }); hourDirty = true; },
   });
-  if (state.camera !== 'iso' && state.camera !== 'gap') { state.camera = 'iso'; flyTo('iso'); }
+  cameraForSequence(m);
 }
 
 function startDisassemble() {
   const m = selectedUnit().model;
-  if (!m) { ui?.toast?.('A안은 해체할 차열 구조물이 없습니다. C안 또는 C′안을 선택하세요.'); return; }
+  if (!m) { ui?.toast?.('A안은 해체할 차열 구조물이 없습니다. B안, C안 또는 C′안을 선택하세요.'); return; }
   if (state.view.explode > 0) { state.view.explode = 0; for (const u of Object.values(units)) if (u.model) animator.setExplode(u.model, 0); }
-  const revSteps = [...m.installSteps].reverse().map((s) => ({ title: `해체 · ${s.title}`, minutes: s.minutes }));
+  const revSteps = disassemblySequence(m).map((s) => ({ title: s.title, minutes: s.minutes }));
   const totalMin = revSteps.reduce((a, s) => a + s.minutes, 0);
+  const doneText = getDesign(m.id)?.disassembleDone || `${displayId(m.id)} 해체 완료 — 무천공 분리·재사용 가능`;
   animator.playDisassemble(m, {
     speed: 1,
     onStep: (i, step, elapsedMin) => { ui?.setInstall?.({ running: true, mode: 'disassemble', stepIndex: i, steps: revSteps, elapsedMin, totalMin }); hourDirty = true; },
     onDone: () => {
       ui?.setInstall?.({ running: false, mode: 'disassemble', stepIndex: revSteps.length, steps: revSteps, elapsedMin: totalMin, totalMin });
-      ui?.toast?.(`${displayId(state.design)} 해체 완료 — 무천공 분리·재사용 가능`);
+      ui?.toast?.(doneText);
+      syncNotices();
       hourDirty = true;
     },
   });
-  if (state.camera !== 'iso' && state.camera !== 'gap') { state.camera = 'iso'; flyTo('iso'); }
+  cameraForSequence(m);
 }
 
 function startRestore() {
   for (const u of Object.values(units)) if (u.model) animator.restoreAssembled(u.model);
   pushInstallSteps();
+  syncNotices();
   hourDirty = true;
   ui?.toast?.('조립 완료 상태로 복원했습니다.');
 }
@@ -473,7 +594,8 @@ function startRestore() {
 // ------------------------------------------------------------------ overlays
 let rr = 0;
 const isShown = (o) => { for (; o; o = o.parent) if (!o.visible) return false; return true; };
-const shownOnly = (list) => (animator.isAnimating?.() ? list.filter(isShown) : list);
+// Hidden parts (mid-animation, or removed by a finished teardown) must not catch sun rays.
+const shownOnly = (list) => list.filter(isShown);
 
 function activeThermal(entry) {
   if (!entry) return null;
@@ -563,11 +685,16 @@ const scenario = {
 };
 
 // ------------------------------------------------------------------ boot
-ui = createUI({ state, set, config, scenario, legend: { css: HEAT_CSS_GRADIENT, min: TEMP_RANGE[0], max: TEMP_RANGE[1] } });
+ui = createUI({
+  state, set, config, scenario,
+  legend: { css: HEAT_CSS_GRADIENT, min: TEMP_RANGE[0], max: TEMP_RANGE[1] },
+  designOf: (id) => effectiveDesign(id, state),
+});
 if (sharedFromLink) ui?.toast?.('공유받은 설정을 불러왔습니다.');
 ui?.setAssumptions?.({ thermal: THERMAL_ASSUMPTIONS });
 
 for (const id of DESIGN_IDS) buildModel(id);
+refreshCpCallouts();
 units.A.flow.setGap(null);
 applyLayout();
 applySection();
@@ -621,7 +748,7 @@ function advance(dt) {
     updateOverlays();
     hourDirty = false;
   }
-  if (clockTick > 0.1) { clockTick = 0; pushClock(); if (state.view.labels) declutterLabels(); }
+  if (clockTick > 0.1) { clockTick = 0; pushClock(); syncNotices(); if (state.view.labels) declutterLabels(); }
 
   for (const u of Object.values(units)) {
     if (!u.root.visible) continue;

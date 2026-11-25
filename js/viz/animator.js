@@ -1,29 +1,36 @@
 // animator.js — exploded view, step-by-step install AND disassemble playback for a DesignModel.
 // DOM-free. Per-object state lives in obj.userData.__anim; per-model state in model.group.userData.__anim.
+//
+// Optional per-object hints (userData): dropH (m, default 2.4) and dropEase ('back' | 'smooth').
+// Optional per-step fields: holdSec (minimum step duration), dropSec (per-object move duration).
+// Optional model.disassembleSteps = [{ title, minutes, objects, reveal, holdSec, dropSec }]: a custom teardown.
+//   `objects` lift away; `reveal` objects (e.g. B's drill holes left in the roof) appear during that step and
+//   stay visible until the model is restored or installed again. Without it, teardown = reversed install.
 import * as THREE from 'three';
 
 const DROP_H = 2.4;          // install/disassemble lift height (m)
 const DROP_DUR = 0.72;       // seconds per object move (at speed 1)
+const REVEAL_STAGGER = 0.22; // seconds between revealed objects of one step
 const DT_MAX = 0.05;
 const UP = new THREE.Vector3(0, 1, 0);
 
 const clamp01 = (k) => (k < 0 ? 0 : k > 1 ? 1 : k);
 const smoothstep = (k) => { k = clamp01(k); return k * k * (3 - 2 * k); };
 
-function dropOffset(u) {
-  if (u <= 0) return DROP_H;
+function dropOffset(u, H = DROP_H, ease = 'back') {
+  if (u <= 0) return H;
   if (u >= 1) return 0;
+  if (ease === 'smooth') return H * (1 - smoothstep(u));
   const c1 = 1.70158, c3 = c1 + 1, w = u - 1;
   const back = 1 + c3 * w * w * w + c1 * w * w;
-  const off = DROP_H * (1 - back);
+  const off = H * (1 - back);
   return off < 0 ? off * 0.14 : off;
 }
 
-function liftOffset(u) {
+function liftOffset(u, H = DROP_H) {
   if (u <= 0) return 0;
-  if (u >= 1) return DROP_H;
-  const k = smoothstep(u);
-  return DROP_H * k;
+  if (u >= 1) return H;
+  return H * smoothstep(u);
 }
 
 function vec3Of(e) {
@@ -46,6 +53,7 @@ function ensureAnim(obj, group) {
   const explode = vec3Of(obj.userData.explode);
   const up = UP.clone();
   if (dirToParent) { explode.applyMatrix3(dirToParent); up.applyMatrix3(dirToParent); }
+  const h = Number(obj.userData.dropH);
   a = {
     group,
     basePos: obj.position.clone(),
@@ -55,6 +63,8 @@ function ensureAnim(obj, group) {
     toParent,
     explodeLocal: explode,
     upLocal: up,
+    dropH: Number.isFinite(h) && h > 0 ? h : DROP_H,
+    ease: obj.userData.dropEase === 'smooth' ? 'smooth' : 'back',
     explodeE: 0,
     drop: 0,
     hidden: false,
@@ -80,7 +90,7 @@ function modelState(model) {
   return u.__anim;
 }
 
-function uniq(list) { return [...new Set(list.filter((o) => o && o.isObject3D))]; }
+function uniq(list) { return [...new Set((list || []).filter((o) => o && o.isObject3D))]; }
 
 function explodeObjects(model) {
   const out = [];
@@ -88,6 +98,22 @@ function explodeObjects(model) {
   for (const s of model.installSteps || []) out.push(...(s.objects || []));
   return uniq(out);
 }
+
+/** Teardown sequence of a model: its custom disassembleSteps, or the install steps in reverse. */
+export function disassemblySequence(model) {
+  const custom = model && Array.isArray(model.disassembleSteps) ? model.disassembleSteps : null;
+  if (custom && custom.length) return custom.map((s) => ({ ...s }));
+  return [...(model?.installSteps || [])].reverse().map((s) => ({ ...s, title: `해체 · ${s.title}` }));
+}
+
+/** Objects that only exist after teardown (shown by `reveal`), e.g. B's drill holes. */
+export function revealObjects(model) {
+  const out = [];
+  for (const s of model?.disassembleSteps || []) out.push(...(s.reveal || []));
+  return uniq(out);
+}
+
+function setRevealed(model, on) { for (const o of revealObjects(model)) o.visible = !!on; }
 
 export function createAnimator() {
   const playbacks = new Map(); // model -> active install or disassemble playback
@@ -130,6 +156,7 @@ export function createAnimator() {
       const a = o.userData.__anim;
       if (a) { a.hidden = false; a.drop = 0; applyPose(o); }
     }
+    setRevealed(model, false);
     applyExplode(model, smoothstep(modelState(model).explodeK));
   }
 
@@ -140,14 +167,16 @@ export function createAnimator() {
         if (!a) continue;
         if (pb.mode === 'disassemble') {
           a.hidden = true;
-          a.drop = DROP_H;
+          a.drop = a.dropH;
         } else {
           a.hidden = false;
           a.drop = 0;
         }
         applyPose(o);
       }
+      if (pb.mode === 'disassemble') for (const o of st.reveal) o.visible = true;
     }
+    if (pb.mode === 'install') setRevealed(pb.model, false);
     playbacks.delete(pb.model);
     if (pb.mode === 'install') applyExplode(pb.model, smoothstep(modelState(pb.model).explodeK));
   }
@@ -161,12 +190,15 @@ export function createAnimator() {
     let cum = 0;
     return steps.map((step) => {
       const objects = uniq(step.objects || []);
+      const reveal = uniq(step.reveal || []);
       const n = objects.length;
-      const D = Math.min(3.5, 1.1 + 0.14 * n) / sp;
-      const drop = Math.min(DROP_DUR / sp, D * 0.8);
+      const hold = Number.isFinite(step.holdSec) && step.holdSec > 0 ? step.holdSec / sp : 0;
+      const D = Math.max(hold, Math.min(3.5, 1.1 + 0.14 * n) / sp);
+      const moveSec = Number.isFinite(step.dropSec) && step.dropSec > 0 ? step.dropSec : DROP_DUR;
+      const drop = Math.min(moveSec / sp, D * 0.8);
       const stagger = n > 1 ? Math.max(0, Math.min(0.18 / sp, (D - drop - 0.12 / sp) / (n - 1))) : 0;
       const minutes = Number.isFinite(step.minutes) ? step.minutes : 0;
-      const entry = { step, objects, D, drop, stagger, minutes, cumMin: cum };
+      const entry = { step, objects, reveal, D, drop, stagger, revStagger: REVEAL_STAGGER / sp, minutes, cumMin: cum };
       cum += minutes;
       return entry;
     });
@@ -178,6 +210,7 @@ export function createAnimator() {
     prepare(model);
     tweens.delete(model);
     applyExplode(model, 0);
+    setRevealed(model, false);
     const sp = Number.isFinite(speed) && speed > 0 ? speed : 1;
     const plan = buildPlan(model.installSteps || [], sp);
     const totalMin = plan.reduce((a, s) => a + s.minutes, 0);
@@ -185,7 +218,7 @@ export function createAnimator() {
     for (const st of plan) {
       for (const o of st.objects) {
         const a = ensureAnim(o, model.group);
-        a.hidden = true; a.drop = DROP_H;
+        a.hidden = true; a.drop = a.dropH;
         applyPose(o);
       }
     }
@@ -194,7 +227,7 @@ export function createAnimator() {
     if (plan.length && onStep) onStep(0, plan[0].step, 0, totalMin);
   }
 
-  /** Step-by-step reverse disassembly animation (§10.4 ③): unfastens and removes reusable modules. */
+  /** Step-by-step disassembly (§10.4 ③): custom model.disassembleSteps or the reversed install sequence. */
   function playDisassemble(model, { speed = 1, onStep, onDone } = {}) {
     if (!model || !model.group) return;
     playbacks.delete(model);
@@ -202,11 +235,7 @@ export function createAnimator() {
     tweens.delete(model);
     applyExplode(model, 0);
     const sp = Number.isFinite(speed) && speed > 0 ? speed : 1;
-    const revSteps = [...(model.installSteps || [])].reverse().map((s) => ({
-      ...s,
-      title: `해체 · ${s.title}`,
-    }));
-    const plan = buildPlan(revSteps, sp);
+    const plan = buildPlan(disassemblySequence(model), sp);
     const totalMin = plan.reduce((a, s) => a + s.minutes, 0);
 
     for (const st of plan) {
@@ -216,6 +245,7 @@ export function createAnimator() {
         applyPose(o);
       }
     }
+    setRevealed(model, false);
     const pb = { mode: 'disassemble', model, plan, i: 0, t: 0, totalMin, onStep, onDone };
     playbacks.set(model, pb);
     if (plan.length && onStep) onStep(0, plan[0].step, 0, totalMin);
@@ -231,15 +261,16 @@ export function createAnimator() {
         const u = done ? 1 : (pb.t - j * st.stagger) / st.drop;
         if (pb.mode === 'install') {
           a.hidden = u < 0;
-          a.drop = u < 0 ? DROP_H : dropOffset(Math.min(1, u));
+          a.drop = u < 0 ? a.dropH : dropOffset(Math.min(1, u), a.dropH, a.ease);
         } else {
           a.hidden = u >= 1;
-          a.drop = u <= 0 ? 0 : liftOffset(Math.min(1, u));
+          a.drop = u <= 0 ? 0 : liftOffset(Math.min(1, u), a.dropH);
         }
         applyPose(o);
       });
+      if (pb.mode === 'disassemble') st.reveal.forEach((o, j) => { o.visible = done || pb.t >= j * st.revStagger; });
       const frac = Math.min(1, pb.t / st.D);
-      if (pb.onStep) pb.onStep(pb.i, st.step, pb.cumMin + st.minutes * frac, pb.totalMin);
+      if (pb.onStep) pb.onStep(pb.i, st.step, st.cumMin + st.minutes * frac, pb.totalMin);
       if (!done) return;
       pb.t -= st.D;
       pb.i++;

@@ -1,6 +1,7 @@
 // Physics & thermal solver test suite for K-Roof container heat-shield simulation
 import { strict as assert } from 'node:assert';
-import { SITES, WEATHER_PRESETS, ROOF, INTERIOR, ALL_IDS, DESIGN_IDS, getDesign } from '../js/config.js';
+import { SITES, WEATHER_PRESETS, ROOF, INTERIOR, ALL_IDS, DESIGN_IDS, getDesign, CP_CANDIDATES } from '../js/config.js';
+import { cpDesignFor } from '../js/custom.js';
 import { dayOfYear, solarPosition, clearSkyIrradiance, sunTimes, skyTemperature, ambientTemperature } from '../js/physics/sun.js';
 import {
   simulateDay,
@@ -151,6 +152,32 @@ for (const id of ALL_IDS) {
   for (const id of DESIGN_IDS) {
     check(pairs50[id].on.summary.coolingKWh < pairs50.A.on.summary.coolingKWh, `50mm: ${id} still saves cooling vs A`);
   }
+}
+
+// 6b. C′ surface-property sensitivity (추가 수정 요청 §2): every candidate improves on the original C′
+{
+  const runs = Object.fromEntries(CP_CANDIDATES.map((c) => [c.id, simulatePair({ ...baseOpts, design: cpDesignFor(c) })]));
+  const keys = [['off', 'TroofBotMax'], ['off', 'TinMax'], ['off', 'roofHeatKWh'], ['on', 'coolingKWh']];
+  const v = (id, [br, k]) => runs[id][br].summary[k];
+  const better = (a, b) => keys.every((key) => v(a, key) < v(b, key) - 1e-6);
+
+  const cpBase = pairs0.Cp;
+  check(keys.every((key) => Math.abs(v('base', key) - cpBase[key[0]].summary[key[1]]) < 1e-9), 'candidate "기존" reproduces the original C′ exactly');
+  check(['c1', 'c2', 'c3', 'c4', 'c5', 'c6'].every((id) => better(id, 'base')), 'all 6 candidates lower roof-bottom peak, indoor peak, roof heat gain and cooling load');
+  check(better('c2', 'c1') && better('c4', 'c3'), 'stronger change (ρ 0.89 > 0.85, ε 0.12 < 0.20) helps more');
+  check(better('c5', 'c1') && better('c5', 'c3') && better('c6', 'c2') && better('c6', 'c4'), 'combined top + bottom improvements beat either alone');
+  check(['base', 'c1', 'c2', 'c3', 'c4', 'c5'].every((id) => better('c6', id)), '후보 6 (ρ 0.89 · ε 0.12) is the best candidate');
+
+  // Observation that motivated the request (2-1): original C′ cools cheaper than B but runs hotter indoors / lets more heat in
+  const B = pairs0.B;
+  check(cpBase.on.summary.coolingKWh < B.on.summary.coolingKWh, `original C′ cooling (${cpBase.on.summary.coolingKWh.toFixed(2)}) < B (${B.on.summary.coolingKWh.toFixed(2)})`);
+  check(cpBase.off.summary.TinMax > B.off.summary.TinMax && cpBase.off.summary.roofHeatKWh > B.off.summary.roofHeatKWh,
+    `original C′ indoor peak / roof heat (${cpBase.off.summary.TinMax.toFixed(2)} °C / ${cpBase.off.summary.roofHeatKWh.toFixed(2)} kWh) above B`);
+  check(v('c1', ['off', 'TinMax']) < B.off.summary.TinMax && v('c1', ['off', 'roofHeatKWh']) < B.off.summary.roofHeatKWh,
+    '후보 1 already overtakes B on indoor peak and roof heat gain');
+  const bTh = getDesign('B').thermal;
+  check(bTh.mode === 'contact' && bTh.gap === 0 && bTh.alphaTop === 0.11 && bTh.epsBottom === 0.12 && bTh.k === 0.44,
+    'B thermal model unchanged by the screw fixing (contact, 0 mm, α 0.11, ε 0.12)');
 }
 
 // 7. Time-step & spin-up numerical convergence + sampleAt interpolation

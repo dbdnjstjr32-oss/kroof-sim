@@ -3,7 +3,12 @@ import { strict as assert } from 'node:assert';
 import * as CFG from '../js/config.js';
 import { dayOfYear } from '../js/physics/sun.js';
 import { simulatePair } from '../js/physics/thermal.js';
+import { cpDesignFor, effectiveDesign } from '../js/custom.js';
 import {
+  buildSensitivityRows,
+  fastenerDetailSvg,
+  fmtDelta,
+  surfaceShort,
   DASH,
   fmtNum,
   fmtSigned,
@@ -64,6 +69,18 @@ const realThermal = Object.fromEntries(
     }),
   ])
 );
+
+// C′ candidate results (추가 수정 요청 2-3) under the same conditions
+const thermalOf = (design) => simulatePair({ design, site: seoul, dayOfYear: doy, weather: { ...hw }, roof: { ...CFG.ROOF }, interior: { ...CFG.INTERIOR } });
+const candThermal = Object.fromEntries(CFG.CP_CANDIDATES.map((c) => [c.id, c.id === 'base' ? realThermal.Cp : thermalOf(cpDesignFor(c))]));
+const c5 = CFG.CP_CANDIDATES.find((c) => c.id === 'c5');
+const adjustedResults = {
+  thermal: { ...realThermal, Cp: candThermal.c5 },
+  cpBase: realThermal.Cp,
+  cpCandidates: candThermal,
+  cpSurface: { rhoSolar: c5.rhoSolar, epsBottom: c5.epsBottom },
+  cpAdjusted: true,
+};
 
 // ================================================================ 1. Pure helpers
 eq(shortName('A'), 'A안', 'shortName A');
@@ -135,6 +152,59 @@ eq(fmtPlain(-0), '0', 'fmtPlain normalizes -0');
   const sRoof = buildTempSeries(realThermal, { design: 'C', acOn: false, viewTab: 'roof', visible: { A: false, air: false } }, CFG);
   eq(sRoof.length, 3, 'roof tab with A & air hidden returns B, C, Cp roof traces');
   ok(sRoof.every((s) => s.kind === 'roof'), 'all traces are roof');
+
+  // Adjusted C′: the original C′ curves are added (faded) for the before/after comparison
+  const sAdj = buildTempSeries(adjustedResults.thermal, { design: 'Cp', acOn: false, viewTab: 'both', visible: {}, cpBase: realThermal.Cp }, CFG);
+  eq(sAdj.length, 11, 'both tab with adjusted C′ adds original C′ roof + indoor traces (11)');
+  const baseRoof = sAdj.find((s) => s.key === 'CpBase:roof');
+  ok(baseRoof && baseRoof.color.startsWith('rgba(') && baseRoof.label.includes('기존 물성'), 'original C′ trace is faded and labelled');
+  ok(Math.max(...baseRoof.data.map((p) => p.y)) > Math.max(...sAdj.find((s) => s.key === 'Cp:roof').data.map((p) => p.y)),
+    'adjusted C′ (후보 5) runs cooler than the original C′');
+  eq(buildTempSeries(adjustedResults.thermal, { viewTab: 'roof', visible: { CpBase: false }, cpBase: realThermal.Cp }, CFG).some((s) => s.id === 'CpBase'), false,
+    'original C′ trace can be hidden');
+}
+
+// C′ adjusted: compare table, KPI second line, sensitivity table (추가 수정 요청 2-4)
+{
+  const cmp = buildCompareRows(CFG, adjustedResults);
+  eq(cmp.rows.map((r) => r.id), ['A', 'B', 'C', 'Cp', 'CpBase'], 'adjusted C′ adds an "original C′" row after C′');
+  const rCp = cmp.rows.find((r) => r.id === 'Cp'), rBase = cmp.rows.find((r) => r.id === 'CpBase');
+  ok(rCp.name.includes('조정: ρ 0.85 · ε 0.20') && rBase.name.includes('기존 물성 (ρ 0.75 · ε 0.28)'), 'C′ rows labelled with their surface values');
+  eq([rBase.selId, rBase.ref], ['Cp', true], 'original C′ row selects C′ and is a reference row');
+  ok(rCp.cells.coolingKWh.v < rBase.cells.coolingKWh.v, 'adjusted C′ cooling load below the original');
+
+  const k = computeKpis({ sel: 'Cp', thermal: adjustedResults.thermal, setpoint: 26, cpBase: realThermal.Cp });
+  ok(k.every((t) => t.cmpText && t.cmpText.startsWith('기존 C′안 대비 ')), 'C′ KPI tiles show the change vs the original C′');
+  ok(k.every((t) => t.cmpTone === 'good'), 'all four C′ KPIs improve with 후보 5');
+  ok(computeKpis({ sel: 'B', thermal: realThermal, cpBase: realThermal.Cp }).every((t) => !t.cmpText), 'no C′ comparison line on other designs');
+
+  const sens = buildSensitivityRows(CFG, adjustedResults);
+  eq(sens.rows.map((r) => r.id), ['base', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6'], 'sensitivity rows: 기존 + 후보 1~6');
+  ok(sens.ready && sens.rows.every((r) => !r.pending), 'all candidates computed');
+  eq(sens.rows.filter((r) => r.current).map((r) => r.id), ['c5'], 'current setting marks 후보 5');
+  ok(sens.rows.filter((r) => r.id !== 'base').every((r) => r.cells.TinMax.delta < 0 && r.cells.coolingKWh.delta < 0 && r.cells.savingPct.delta > 0),
+    'every candidate lowers indoor peak / cooling and raises the saving vs the original C′');
+  const c6 = sens.rows.find((r) => r.id === 'c6');
+  ok(['TroofBotMax', 'TinMax', 'roofHeatKWh', 'coolingKWh', 'savingPct'].every((key) => c6.cells[key].best), '후보 6 is best in every column');
+  eq(sens.refs.map((r) => r.id), ['B', 'C'], 'B and C reference rows');
+  eq(fmtDelta(COMPARE_COLUMNS.find((c) => c.key === 'savingPct'), 2.25), '+2.3%p', 'saving delta in %p');
+  eq(fmtDelta(COMPARE_COLUMNS[0], -1.234), '−1.2', 'temperature delta, 1 decimal');
+
+  const custom = buildSensitivityRows(CFG, { ...adjustedResults, cpSurface: { rhoSolar: 0.8, epsBottom: 0.25 } });
+  ok(custom.rows.length === 8 && custom.rows[7].kind === 'custom' && custom.rows[7].current, 'user-defined combination adds a "현재 설정" row');
+  const pending = buildSensitivityRows(CFG, { thermal: realThermal, cpSurface: { ...CFG.CP_SURFACE_DEFAULT } });
+  ok(!pending.ready && !pending.rows[0].pending && pending.rows[1].pending, 'before background runs: original from Cp results, candidates pending');
+  eq(surfaceShort({ rhoSolar: 0.89, epsBottom: 0.12 }), 'ρ 0.89 · ε 0.12', 'surfaceShort');
+
+  const csv = buildCsv(cmp, { conditions: 'x', sensitivity: sens });
+  ok(csv.includes('C′안 표면 물성 민감도') && csv.includes('후보 6') && csv.includes('0.89,0.11,0.12') && csv.includes('C′안 – 기존 물성'), 'CSV includes the sensitivity table');
+}
+
+// B fastener concept section (추가 수정 요청 1-3 (2))
+{
+  const svg = fastenerDetailSvg('t1');
+  ok(['방수 직결피스 머리', 'EPDM 고무 와셔', 'ACP 패널 4T', '기존 지붕 강판 1.2T'].every((t) => svg.includes(t)), 'fastener section labels ①–④');
+  ok(svg.includes('id="fx-hatch-t1"') && !fastenerDetailSvg('t2').includes('fx-hatch-t1'), 'fastener SVG pattern ids are unique per instance');
 }
 
 // Misc pure helpers
@@ -347,7 +417,7 @@ const scenario = {
 };
 
 store.set('kroof.ui.theme', 'dark');
-const ui = createUI({ state, set, config: CFG, legend: { css: 'x', min: 20, max: 80 }, scenario });
+const ui = createUI({ state, set, config: CFG, legend: { css: 'x', min: 20, max: 80 }, scenario, designOf: (id) => effectiveDesign(id, state) });
 const $ = (id) => doc.getElementById(id);
 const toastText = () => $('toast').textContent;
 const pick = (el) => { el.checked = true; fire(el, 'change'); };
@@ -357,7 +427,7 @@ eq(doc.documentElement.getAttribute('data-theme'), 'dark', 'saved theme applied 
 ok(observers.some((o) => o.opts?.attributeFilter?.includes('data-theme')), 'MutationObserver watches data-theme');
 
 // Section structure & controls
-const SECTION_ORDER = ['sec-design', 'sec-time', 'sec-weather', 'sec-roof', 'sec-display', 'sec-app', 'sec-scenario'];
+const SECTION_ORDER = ['sec-design', 'sec-time', 'sec-weather', 'sec-roof', 'sec-cp', 'sec-display', 'sec-app', 'sec-scenario'];
 eq($('controls').querySelector('.ctl-flow').children.map((e) => e.id), SECTION_ORDER, 'control sections match expected order');
 for (const id of SECTION_ORDER) ok($(`${id}-sum`) !== null, `${id} has summary slot`);
 for (const id of [
@@ -367,6 +437,7 @@ for (const id of [
   'cam-iso', 'cam-section', 'cam-top', 'cam-gap', 'cam-detail', 'cam-yard',
   'compare-table', 'spec-table', 'chart-temp', 'btn-chart-ac', 'tab-temp-both', 'tab-temp-roof', 'tab-temp-indoor',
   'tog-series-A', 'tog-series-Cp', 'tog-series-air', 'btn-install-2', 'btn-disassemble-2', 'btn-restore-2',
+  'ctl-cp-preset', 'ctl-cp-rho', 'ctl-cp-eps', 'btn-cp-reset', 'out-cp-alpha', 'sens-table', 'hud-fastener', 'tog-series-CpBase',
 ]) {
   ok($(id) !== null, `element #${id} exists`);
 }
@@ -446,6 +517,61 @@ eq(state.actions.restoreSeq, 1, 'restore increments restoreSeq');
 ui.setInstall({ running: true, mode: 'disassemble', stepIndex: 1, steps: [{ title: '1', minutes: 5 }, { title: '2', minutes: 5 }], elapsedMin: 6, totalMin: 10 });
 ok(!$('hud-install').hidden && $('hud-install-step').textContent === '해체 2/2', 'HUD displays disassemble step progress');
 ok($('btn-disassemble').innerHTML.includes('해체 중…'), 'disassemble button shows active state');
+ui.setInstall({ running: false, mode: 'install', stepIndex: -1, steps: [], elapsedMin: 0, totalMin: 0 });
+
+// B안 drilled fixing: features, fastener section, detail view inset, reuse rows (추가 수정 요청 §1)
+fire($('cam-iso'), 'click');
+pick($('ctl-design-B'));
+await settle();
+ok($('ov-features') !== null && $('ov-features').querySelectorAll('li').length === 6, 'B overview lists the 6 drilled-fixing features');
+ok($('ov-features').textContent.includes('밀착형 천공 고정 방식') && $('ov-features').textContent.includes('해체 후 천공부 방수 및 보수 필요'), 'B feature texts');
+ok($('ov-fastener') !== null, 'B overview shows the fastener section');
+eq($('hud-fastener').hidden, true, 'fastener inset hidden outside the detail view');
+fire($('btn-fastener-3d'), 'click');
+await settle();
+eq(state.camera, 'detail', '3D 체결부 확대 selects the detail camera');
+eq($('hud-fastener').hidden, false, 'fastener inset shown for B in the detail view');
+ok($('spec-table').textContent.includes('천공 흔적 잔존') && $('spec-table').textContent.includes('무천공'), 'spec table compares roof drilling / reuse');
+fire($('cam-iso'), 'click');
+await settle();
+eq($('hud-fastener').hidden, true, 'fastener inset hidden again in the iso view');
+
+// C′ surface controls: candidate preset, sliders, reset (추가 수정 요청 2-4)
+setVal($('ctl-cp-preset'), 'c2', 'change');
+await settle();
+eq([state.cpSurface.rhoSolar, state.cpSurface.epsBottom], [0.89, 0.28], '후보 2 preset applied');
+eq(state.design, 'Cp', 'adjusting C′ properties selects C′');
+ok(!$('sec-cp').querySelector('.chg-dot').hidden, 'C′ section marked as changed');
+ok($('sec-cp-sum').textContent.includes('후보 2'), 'C′ section summary names the candidate');
+eq($('out-cp-alpha').textContent, '0.11 (= 1 − ρ)', 'absorptance follows 1 − ρ');
+ok($('ov-cp-adjust') !== null && $('ov-cp-adjust').textContent.includes('ρ 0.89'), 'overview flags the adjusted C′ values');
+ok($('spec-table').textContent.includes('ρ=0.89, α=0.11'), 'spec table shows the adjusted C′ finish');
+
+setVal($('ctl-cp-eps'), '0.15');
+await sleep(180);
+await settle();
+eq(state.cpSurface.epsBottom, 0.15, 'ε slider updates cpSurface.epsBottom');
+eq($('ctl-cp-preset').value, 'custom', 'preset shows 사용자 지정 for a custom combination');
+
+ui.renderResults(adjustedResults);
+await settle();
+const sensHtml = $('sens-table').querySelector('tbody').innerHTML;
+ok(sensHtml.includes('data-cand="c6"') && sensHtml.includes('참고 · B안') && sensHtml.includes('class="dv"'), 'sensitivity table rendered with candidates, deltas and references');
+ok($('compare-table').querySelector('tbody').innerHTML.includes('기존 물성'), 'compare table shows the original C′ row while adjusted');
+ok($('kpi-grid').innerHTML.includes('기존 C′안 대비'), 'C′ KPI tiles show the change vs the original');
+eq($('tog-series-CpBase').hidden, false, 'original C′ chart toggle shown while adjusted');
+fire($('sens-table').querySelector('tbody'), 'click', { target: { closest: () => ({ dataset: { cand: 'c1' } }) } });
+await settle();
+eq([state.cpSurface.rhoSolar, state.cpSurface.epsBottom], [0.85, 0.28], 'clicking a sensitivity row applies that candidate');
+
+fire($('btn-cp-reset'), 'click');
+await settle();
+eq([state.cpSurface.rhoSolar, state.cpSurface.epsBottom], [0.75, 0.28], 'reset restores the original C′ values');
+ok($('sec-cp').querySelector('.chg-dot').hidden, 'C′ change dot cleared after reset');
+eq($('ctl-cp-preset').value, 'base', 'preset back to 기존 C′안');
+ui.renderResults({ thermal: realThermal, cpBase: null, cpCandidates: null, cpSurface: { ...CFG.CP_SURFACE_DEFAULT }, cpAdjusted: false });
+await settle();
+eq($('tog-series-CpBase').hidden, true, 'original C′ chart toggle hidden at the original values');
 
 // Custom site clamping
 setVal($('ctl-site'), 'custom', 'change');

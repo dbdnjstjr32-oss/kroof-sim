@@ -103,25 +103,60 @@ export const BASELINE = {
     tieDown: '—',
     auxFix: '—',
     installType: '기준 모델',
+    roofDrilling: '—',
+    afterRemoval: '—',
+    panelReuse: '—',
   },
 };
+
+// ---------------------------------------------------------------- C′안 surface properties (추가 수정 요청 §2)
+// Original C′ finish: white heat-shield paint on top (ρ 0.75 → α 0.25), bare galvalume underside (ε 0.28).
+// The user may adjust ρ_top and ε_bottom for a sensitivity study; α_top = 1 − ρ_top, ε_top stays 0.88.
+const CP_BASE = { rhoSolar: 0.75, epsBottom: 0.28 };
+
+/** Display strings for a C′ surface { rhoSolar, epsBottom } (2-decimal, same wording as the spec sheet). */
+export function cpSurfaceTexts({ rhoSolar, epsBottom }) {
+  const r = rhoSolar.toFixed(2), a = (1 - rhoSolar).toFixed(2), e = epsBottom.toFixed(2);
+  return {
+    short: `ρ ${r} · ε ${e}`,
+    calloutSub: `백색 차열도료(ρ=${r}) · 하부 무도장 갈바륨(ε=${e})`,
+    topFinish: `백색 차열도료 (ρ=${r}, α=${a})`,
+    botFinish: `무도장 갈바륨 (ε=${e})`,
+  };
+}
+const CP_BASE_TEXT = cpSurfaceTexts(CP_BASE);
 
 export const DESIGNS = {
   B: {
     id: 'B',
     short: 'B안',
     color: '#0072b2',
-    name: 'ACP 밀착형',
-    fullName: 'B안 – ACP 밀착형',
-    tagline: '기존 컨테이너 지붕 위에 ACP 4T를 공기층 없이 직접 밀착시킨 구조',
-    description: '기존 컨테이너 지붕 강판 상부에 백색 고반사 코팅 ACP(4mm)를 공기층(0mm) 없이 직접 밀착 설치합니다. 공기층 자연환기 없이 차열패널 자체의 반사 및 열저항 효과를 확인하기 위한 비교 모델입니다.',
+    name: 'ACP 밀착형 (천공 고정)',
+    fullName: 'B안 – ACP 밀착형 천공 고정 방식',
+    tagline: '기존 지붕 위에 ACP 4T를 공기층 없이 밀착하고 방수 직결피스로 천공 고정한 구조',
+    description: '기존 컨테이너 지붕 강판(1.2T) 상부에 백색 고반사 코팅 ACP(4mm)를 공기층(0mm) 없이 직접 밀착하고, EPDM 고무 와셔가 결합된 방수 직결피스로 ACP 패널과 기존 지붕 강판을 관통 체결합니다. 별도의 지지대·크로스바·라쳇 스트랩은 적용하지 않습니다. C안·C′안의 무천공 모듈식 설치와 비교해 기존 지붕 손상(천공) 여부와 반복 재사용성의 차이를 확인하기 위한 비교 모델입니다.',
     gapText: '공기층 없음 (0 mm · 직접 접촉 열전달)',
     params: {},
     callouts: [
       { n: 1, text: '차열패널: ACP 4T (백색 고반사)', sub: '상부 반사율 0.89 · 흡수율 0.11' },
       { n: 2, text: '패널 하부: 무도장 알루미늄', sub: '장파 방사율 0.12' },
       { n: 3, text: '지붕 직접 밀착 구조 (공기층 0mm)', sub: '접촉 전도 열전달 적용' },
+      { n: 4, text: '방수 직결피스 천공 체결 (EPDM 고무 와셔)', sub: 'ACP 4T + 기존 지붕 강판 1.2T 관통 · 개념 표현' },
     ],
+    // Shown in the overview when B is selected (추가 수정 요청 1-6).
+    features: {
+      title: 'B안 – 밀착형 천공 고정 방식',
+      items: [
+        { text: '공기층 없음 (0 mm)', tone: 'neutral' },
+        { text: '기존 지붕 직접 천공', tone: 'warn' },
+        { text: '방수 직결피스 체결 (EPDM 고무 와셔)', tone: 'neutral' },
+        { text: '패널 재사용 가능', tone: 'good' },
+        { text: '해체 후 천공부 방수 및 보수 필요', tone: 'warn' },
+        { text: '반복 체결에 따른 손상 가능성', tone: 'warn' },
+      ],
+      note: '피스의 규격·수량·체결 간격은 확정되지 않았으며, 구조·방수 성능이 검증된 시공 상세가 아닌 시각적 개념 표현입니다. 피스에 의한 국부 열교는 C안·C′안의 체결 부재와 동일하게 열해석에서 제외합니다.',
+    },
+    disassembleDone: 'B안 해체 완료 — ACP 패널은 회수·재사용할 수 있지만, 기존 지붕에 천공 흔적이 남아 실링·방수 보수가 필요합니다.',
     thermal: {
       mode: 'contact',
       gap: 0,
@@ -146,10 +181,13 @@ export const DESIGNS = {
       rib: '없음',
       crossbar: '없음',
       pad: '없음',
-      panelFix: '직접 밀착',
-      tieDown: '밀착형',
-      auxFix: '—',
-      installType: '밀착형 (비환기)',
+      panelFix: '방수 직결피스 + EPDM 고무 와셔 (천공 체결)',
+      tieDown: '직결피스로 기존 지붕 강판 1.2T 관통 고정',
+      auxFix: '없음 (지지대·크로스바·스트랩 미적용)',
+      installType: '밀착형 천공 고정 (비환기)',
+      roofDrilling: '천공 (피스가 기존 지붕 강판 관통)',
+      afterRemoval: '천공 흔적 잔존 → 실링·방수 보수 필요',
+      panelReuse: '가능 (반복 체결 시 손상 가능성)',
     },
   },
 
@@ -201,6 +239,9 @@ export const DESIGNS = {
       tieDown: '크로스바 끝단 D링 + 라쳇 스트랩 + J후크',
       auxFix: 'M12 빔 클램프',
       installType: '무천공 모듈식 탈부착형',
+      roofDrilling: '무천공 (크로스바 끝단 스트랩 결속)',
+      afterRemoval: '손상 없음 (원상 유지)',
+      panelReuse: '가능 (모듈 개별 분리·재사용)',
     },
   },
 
@@ -215,7 +256,7 @@ export const DESIGNS = {
     gapText: '공기층 140 mm (10+100+30mm · 폭 방향 자연환기)',
     params: {},
     callouts: [
-      { n: 1, text: '갈바륨 골강판 0.5T (C-76) 12모듈', sub: '백색 차열도료(ρ=0.75) · 하부 무도장 갈바륨' },
+      { n: 1, text: '갈바륨 골강판 0.5T (C-76) 12모듈', sub: CP_BASE_TEXT.calloutSub },
       { n: 2, text: '양단 보강재(30×30×1.4T) 24개', sub: '방수 직결피스(96) · M8 나비볼트/팝너트(48)' },
       { n: 3, text: '아연도금 크로스바 5개 + 고무패드', sub: '100×50×2.9T (3.2m) · 10mm 고무패드 20개' },
       { n: 4, text: '크로스바 끝단 라쳇 스트랩 + C형 클램프', sub: '50mm×8m 스트랩 8개 · 하부 J후크 · C클램프 4개' },
@@ -235,18 +276,18 @@ export const DESIGNS = {
       // Pre-multiplied by shapeFactor 1.15 per §4.2 (do not multiply twice in thermal.js).
       arealMass: 7850 * 0.0005 * 1.15,
       arealHeatCap: 7850 * 0.0005 * 1.15 * 460,
-      rhoSolar: 0.75,
+      rhoSolar: CP_BASE.rhoSolar,
       alphaTop: 0.25,
       epsTop: 0.88,
-      epsBottom: 0.28,
+      epsBottom: CP_BASE.epsBottom,
       tau: 0,
       coverFactor: 1.0,
     },
     specs: {
       panel: '갈바륨 골강판 0.5T (C-76, 12모듈)',
       gapMm: '140 mm (패드 10 + 크로스바 100 + 보강재 30)',
-      topFinish: '백색 차열도료 (ρ=0.75, α=0.25)',
-      botFinish: '무도장 갈바륨 (ε=0.28)',
+      topFinish: CP_BASE_TEXT.topFinish,
+      botFinish: CP_BASE_TEXT.botFinish,
       rib: '아연도금 각관 30×30×1.4T (1m × 24개, 양단)',
       crossbar: '아연도금 각관 100×50×2.9T (3.2m, 5개)',
       pad: '고무패드 100×100×10mm (20개)',
@@ -254,9 +295,56 @@ export const DESIGNS = {
       tieDown: '크로스바 끝단 라쳇 스트랩(8개) + J후크',
       auxFix: '4인치 C형 클램프 (4개) + 모서리 보호재',
       installType: '무천공 모듈식 탈부착형 (경제성 개선)',
+      roofDrilling: '무천공 (스트랩·C형 클램프 결속)',
+      afterRemoval: '손상 없음 (원상 유지)',
+      panelReuse: '가능 (모듈 개별 분리·재사용)',
     },
   },
 };
+
+// ---------------------------------------------------------------- C′안 sensitivity study (추가 수정 요청 2-2 ~ 2-4)
+export const CP_SURFACE_DEFAULT = Object.freeze({ ...CP_BASE });
+
+// Candidate conditions to compare (2-3). ε_top 0.88 and every other C′ property stay as in the base design.
+export const CP_CANDIDATES = [
+  { id: 'base', short: '기존', name: '기존 C′안', rhoSolar: 0.75, epsBottom: 0.28 },
+  { id: 'c1', short: '후보 1', name: '후보 1 – 상부 반사율 개선', rhoSolar: 0.85, epsBottom: 0.28 },
+  { id: 'c2', short: '후보 2', name: '후보 2 – 상부 반사율 추가 개선', rhoSolar: 0.89, epsBottom: 0.28 },
+  { id: 'c3', short: '후보 3', name: '후보 3 – 하부 방사율 개선', rhoSolar: 0.75, epsBottom: 0.20 },
+  { id: 'c4', short: '후보 4', name: '후보 4 – 하부 방사율 추가 개선', rhoSolar: 0.75, epsBottom: 0.12 },
+  { id: 'c5', short: '후보 5', name: '후보 5 – 상부 반사율·하부 방사율 동시 개선', rhoSolar: 0.85, epsBottom: 0.20 },
+  { id: 'c6', short: '후보 6', name: '후보 6 – 상부 반사율·하부 방사율 동시 추가 개선', rhoSolar: 0.89, epsBottom: 0.12 },
+];
+
+/** Top solar absorptance linked to reflectance (α = 1 − ρ), rounded to kill float noise. */
+export function cpAlpha(rhoSolar) {
+  return Math.round((1 - rhoSolar) * 1e4) / 1e4;
+}
+
+/** Clamped C′ surface from a state ({ cpSurface }) or a bare { rhoSolar, epsBottom }; missing values → defaults. */
+export function cpSurfaceOf(src) {
+  const s = src && typeof src === 'object' && src.cpSurface && typeof src.cpSurface === 'object' ? src.cpSurface : src;
+  const pick = (key) => {
+    const sp = CUSTOM_SPEC[`cpSurface.${key}`];
+    const v = s && typeof s === 'object' ? s[key] : undefined;
+    return typeof v === 'number' && Number.isFinite(v) ? Math.min(sp.max, Math.max(sp.min, v)) : CP_SURFACE_DEFAULT[key];
+  };
+  return { rhoSolar: pick('rhoSolar'), epsBottom: pick('epsBottom') };
+}
+
+export function sameCpSurface(a, b) {
+  return !!a && !!b && Math.abs(a.rhoSolar - b.rhoSolar) < 1e-6 && Math.abs(a.epsBottom - b.epsBottom) < 1e-6;
+}
+
+export function isCpAdjusted(src) {
+  return !sameCpSurface(cpSurfaceOf(src), CP_SURFACE_DEFAULT);
+}
+
+/** The candidate (2-3) whose values match `surface`, or null for a user-defined combination. */
+export function cpCandidateOf(surface) {
+  const s = cpSurfaceOf(surface);
+  return CP_CANDIDATES.find((c) => sameCpSurface(c, s)) || null;
+}
 
 export const BASELINE_ID = 'A';
 export const DESIGN_IDS = ['B', 'C', 'Cp'];
@@ -303,6 +391,8 @@ export const CUSTOM_SPEC = {
   'customSite.lat':    { min: -60, max: 66, step: 0.01, default: 37.5665, label: '위도', unit: '°' },
   'customSite.lon':    { min: -180, max: 180, step: 0.01, default: 126.978, label: '경도', unit: '°' },
   'customSite.tz':     { min: -12, max: 14, step: 0.5, default: 9, label: '표준시(UTC+)', unit: 'h' },
+  'cpSurface.rhoSolar':  { min: 0.50, max: 0.95, step: 0.01, default: CP_BASE.rhoSolar, label: 'C′안 상부 태양광 반사율', unit: '' },
+  'cpSurface.epsBottom': { min: 0.05, max: 0.90, step: 0.01, default: CP_BASE.epsBottom, label: 'C′안 하부 장파 방사율', unit: '' },
 };
 
 export const QUALITY_OPTIONS = ['auto', 'low', 'medium', 'high'];
@@ -312,5 +402,6 @@ export function customDefaults() {
   return {
     customSite: { lat: 37.5665, lon: 126.978, tz: 9 },
     ui: { quality: 'auto', autoRotate: false },
+    cpSurface: { ...CP_SURFACE_DEFAULT },
   };
 }

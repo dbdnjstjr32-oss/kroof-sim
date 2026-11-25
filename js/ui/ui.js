@@ -1,6 +1,6 @@
 // ui.js — control rail (#controls), HUD overlay (#hud) and results dashboard (#dashboard).
 // Pure helpers are exported at the top so Node tests can validate calculations without a browser DOM.
-import { chartsAvailable, readTheme, createTempChart } from './charts.js';
+import { chartsAvailable, readTheme, createTempChart, withAlpha } from './charts.js';
 import * as CFG from '../config.js';
 
 export const DASH = '—';
@@ -83,7 +83,7 @@ function getSummaries(entry) {
  *   3) 일일 지붕 열유입량 (kWh, 냉방 OFF)
  *   4) 일일 냉방부하 (kWh, 냉방 ON 08:00~18:00) & A안 대비 절감률 (%)
  */
-export function computeKpis({ sel, thermal, setpoint = 26 }) {
+export function computeKpis({ sel, thermal, setpoint = 26, cpBase = null }) {
   const { off: sOff, on: sOn } = getSummaries(thermal?.[sel]);
   const { off: bOff, on: bOn } = getSummaries(thermal?.A);
   const isBase = sel === 'A';
@@ -94,30 +94,42 @@ export function computeKpis({ sel, thermal, setpoint = 26 }) {
   const dHeat = !isBase && sOff && bOff ? pctChange(sOff.roofHeatKWh, bOff.roofHeatKWh) : null;
   const sav = sOn && bOn ? computeCoolingSaving(bOn.coolingKWh, sOn.coolingKWh, isBase) : null;
 
+  // C′ with adjusted surface properties: second line against the original C′ (추가 수정 요청 §2)
+  const { off: cOff, on: cOn } = sel === 'Cp' && cpBase ? getSummaries(cpBase) : { off: null, on: null };
+  const vsCp = (d, digits, unit) => (isNum(d) ? { cmpText: `기존 C′안 대비 ${fmtSigned(d, digits)} ${unit}`, cmpTone: tone(d) } : {});
+  const cmpRoof = cOff && sOff ? vsCp(sOff.TroofBotMax - cOff.TroofBotMax, 1, '°C') : {};
+  const cmpTin = cOff && sOff ? vsCp(sOff.TinMax - cOff.TinMax, 1, '°C') : {};
+  const cmpHeat = cOff && sOff ? vsCp(pctChange(sOff.roofHeatKWh, cOff.roofHeatKWh), 1, '%') : {};
+  const cmpCool = cOn && sOn ? vsCp(sOn.coolingKWh - cOn.coolingKWh, 2, 'kWh') : {};
+
   return [
     {
       key: 'roofBot', label: '지붕 강판 하면 최고온도', value: sOff?.TroofBotMax, digits: 1, unit: '°C',
       empty: !sOff, delta: dRoof, tone: tone(dRoof),
       deltaText: isBase ? '기준 모델 (A안)' : isNum(dRoof) ? `A안 대비 ${fmtSigned(dRoof, 1)} °C` : '',
       sub: `냉방 OFF 기준 · 기존 1.2T 강판 하면${sOff && isNum(sOff.TroofMaxHour) ? ` (${fmtHHMM(sOff.TroofMaxHour)})` : ''}`,
+      ...cmpRoof,
     },
     {
       key: 'tinMax', label: '실내 최고온도', value: sOff?.TinMax, digits: 1, unit: '°C',
       empty: !sOff, delta: dTin, tone: tone(dTin),
       deltaText: isBase ? '기준 모델 (A안)' : isNum(dTin) ? `A안 대비 ${fmtSigned(dTin, 1)} °C` : '',
       sub: '냉방 OFF 기준 · 24시간 최고 실내 공기온도',
+      ...cmpTin,
     },
     {
       key: 'roofHeat', label: '일일 지붕 열유입량', value: sOff?.roofHeatKWh, digits: 2, unit: 'kWh',
       empty: !sOff, delta: dHeat, tone: tone(dHeat),
       deltaText: isBase ? '기준 모델 (A안)' : isNum(dHeat) ? `A안 대비 ${fmtSigned(dHeat, 1)} %` : '',
       sub: '냉방 OFF 기준 · 실내 방향 양의 열유입 누적',
+      ...cmpHeat,
     },
     {
       key: 'cooling', label: '일일 냉방부하 (열에너지)', value: sOn?.coolingKWh, digits: 2, unit: 'kWh',
       empty: !sOn, delta: sav?.valid ? -sav.pct : null, tone: sav?.valid ? (sav.pct > 0 ? 'good' : sav.pct < 0 ? 'bad' : 'neutral') : 'neutral',
       deltaText: !sOn ? '' : !sav?.valid ? 'A안 대비 절감률 N/A' : isBase ? 'A안 대비 절감률 0.0 %' : `A안 대비 절감률 ${sav.text} %`,
       sub: `냉방 ON (08:00~18:00 · 설정 ${fmtPlain(setpoint)}°C · 소비전력량 아님)`,
+      ...cmpCool,
     },
   ];
 }
@@ -131,31 +143,25 @@ export const COMPARE_COLUMNS = [
   { key: 'savingPct', label: 'A안 대비 냉방부하 절감률', unit: '%', group: 'on', better: 'max', digits: 1 },
 ];
 
-export function buildCompareRows(config, results = {}) {
-  const ids = config.ALL_IDS || ['A', 'B', 'C', 'Cp'];
-  const getD = (id) => (typeof config.getDesign === 'function' ? config.getDesign(id) : (id === 'A' ? config.BASELINE : config.DESIGNS?.[id]));
-  const th = results.thermal || {};
-  const { on: baseOn } = getSummaries(th.A);
+/** The 5 COMPARE_COLUMNS cells of one thermal entry ({ off, on }); savings are relative to A's AC-ON load. */
+function metricCells(entry, baseOn, isBase = false) {
+  const { off: sOff, on: sOn } = getSummaries(entry);
+  const c = {};
+  c.TroofBotMax = { v: sOff?.TroofBotMax, text: sOff ? fmtNum(sOff.TroofBotMax, 1) : '…' };
+  c.TinMax = { v: sOff?.TinMax, text: sOff ? fmtNum(sOff.TinMax, 1) : '…' };
+  c.roofHeatKWh = { v: sOff?.roofHeatKWh, text: sOff ? fmtNum(sOff.roofHeatKWh, 2) : '…' };
+  c.coolingKWh = { v: sOn?.coolingKWh, text: sOn ? fmtNum(sOn.coolingKWh, 2) : '…' };
+  if (sOn && baseOn) {
+    const sav = computeCoolingSaving(baseOn.coolingKWh, sOn.coolingKWh, isBase);
+    c.savingPct = { v: sav.valid ? sav.pct : null, text: sav.valid ? `${sav.text}%` : 'N/A', na: !sav.valid };
+  } else {
+    c.savingPct = { v: null, text: '…' };
+  }
+  return c;
+}
 
-  const rows = ids.map((id) => {
-    const d = getD(id) || {};
-    const { off: sOff, on: sOn } = getSummaries(th[id]);
-    const isBase = id === 'A';
-    const c = {};
-    c.TroofBotMax = { v: sOff?.TroofBotMax, text: sOff ? fmtNum(sOff.TroofBotMax, 1) : '…' };
-    c.TinMax = { v: sOff?.TinMax, text: sOff ? fmtNum(sOff.TinMax, 1) : '…' };
-    c.roofHeatKWh = { v: sOff?.roofHeatKWh, text: sOff ? fmtNum(sOff.roofHeatKWh, 2) : '…' };
-    c.coolingKWh = { v: sOn?.coolingKWh, text: sOn ? fmtNum(sOn.coolingKWh, 2) : '…' };
-    if (sOn && baseOn) {
-      const sav = computeCoolingSaving(baseOn.coolingKWh, sOn.coolingKWh, isBase);
-      c.savingPct = { v: sav.valid ? sav.pct : null, text: sav.valid ? `${sav.text}%` : 'N/A', na: !sav.valid };
-    } else {
-      c.savingPct = { v: null, text: '…' };
-    }
-    return { id, short: shortName(id), name: d.fullName || d.name || id, color: d.color, cells: c };
-  });
-
-  for (const col of COMPARE_COLUMNS) {
+function markBest(rows, columns) {
+  for (const col of columns) {
     const cand = rows.filter((r) => isNum(r.cells[col.key]?.v));
     if (cand.length < 2) continue;
     const vals = cand.map((r) => r.cells[col.key].v);
@@ -164,7 +170,123 @@ export function buildCompareRows(config, results = {}) {
     const target = col.better === 'min' ? lo : hi;
     for (const r of cand) if (Math.abs(r.cells[col.key].v - target) < 1e-9) r.cells[col.key].best = true;
   }
+}
+
+const sameSurface = (a, b) => !!a && !!b && isNum(a.rhoSolar) && isNum(b.rhoSolar)
+  && Math.abs(a.rhoSolar - b.rhoSolar) < 1e-6 && Math.abs(a.epsBottom - b.epsBottom) < 1e-6;
+export function surfaceShort(s) {
+  return s && isNum(s.rhoSolar) && isNum(s.epsBottom) ? `ρ ${s.rhoSolar.toFixed(2)} · ε ${s.epsBottom.toFixed(2)}` : '';
+}
+
+/**
+ * Final comparison rows (A, B, C, C′). When C′'s surface properties are adjusted (results.cpAdjusted) the C′ row
+ * is labelled with the new values and a reference row "C′안 – 기존 물성" (results.cpBase) follows it.
+ */
+export function buildCompareRows(config, results = {}) {
+  const ids = config.ALL_IDS || ['A', 'B', 'C', 'Cp'];
+  const getD = (id) => (typeof config.getDesign === 'function' ? config.getDesign(id) : (id === 'A' ? config.BASELINE : config.DESIGNS?.[id]));
+  const th = results.thermal || {};
+  const { on: baseOn } = getSummaries(th.A);
+
+  const rows = [];
+  for (const id of ids) {
+    const d = getD(id) || {};
+    const row = { id, selId: id, short: shortName(id), name: d.fullName || d.name || id, color: d.color, cells: metricCells(th[id], baseOn, id === 'A') };
+    rows.push(row);
+    if (id === 'Cp' && results.cpAdjusted && results.cpBase) {
+      row.name = `${row.name} (조정: ${surfaceShort(results.cpSurface)})`;
+      row.adjusted = true;
+      rows.push({
+        id: 'CpBase', selId: 'Cp', ref: true, short: 'C′안 기존',
+        name: `C′안 – 기존 물성 (${surfaceShort(config.CP_SURFACE_DEFAULT || { rhoSolar: 0.75, epsBottom: 0.28 })})`,
+        color: d.color, cells: metricCells(results.cpBase, baseOn, false),
+      });
+    }
+  }
+  markBest(rows, COMPARE_COLUMNS);
   return { columns: COMPARE_COLUMNS, rows };
+}
+
+/**
+ * C′ surface-property sensitivity table (추가 수정 요청 2-3): one row per candidate (+ the current user setting
+ * when it matches none), each metric with its difference from the original C′, plus B / C reference rows.
+ */
+export function buildSensitivityRows(config, results = {}) {
+  const cands = config.CP_CANDIDATES || [];
+  const getD = (id) => (typeof config.getDesign === 'function' ? config.getDesign(id) : config.DESIGNS?.[id]) || {};
+  const th = results.thermal || {};
+  const pool = results.cpCandidates || {};
+  const { on: baseOn } = getSummaries(th.A);
+  const cur = results.cpSurface || null;
+
+  const rows = cands.map((c) => {
+    const entry = c.id === 'base' ? (pool.base || results.cpBase || (results.cpAdjusted ? null : th.Cp)) : pool[c.id];
+    return {
+      kind: 'cand', id: c.id, short: c.short, name: c.name,
+      surface: { rhoSolar: c.rhoSolar, epsBottom: c.epsBottom },
+      current: sameSurface(cur, c), pending: !entry, cells: metricCells(entry, baseOn, false),
+    };
+  });
+  if (cur && !cands.some((c) => sameSurface(cur, c))) {
+    rows.push({
+      kind: 'custom', id: 'custom', short: '현재', name: '현재 설정 (사용자 지정)', surface: { ...cur },
+      current: true, pending: !th.Cp, cells: metricCells(th.Cp, baseOn, false),
+    });
+  }
+  const base = rows.find((r) => r.id === 'base');
+  for (const r of rows) {
+    if (r === base) continue;
+    for (const col of COMPARE_COLUMNS) {
+      const v = r.cells[col.key]?.v, b = base?.cells[col.key]?.v;
+      if (isNum(v) && isNum(b)) r.cells[col.key].delta = v - b;
+    }
+  }
+  markBest(rows, COMPARE_COLUMNS);
+  const refs = ['B', 'C'].filter((id) => th[id]).map((id) => ({
+    kind: 'ref', id, short: shortName(id), name: `참고 · ${shortName(id)} ${getD(id).name || ''}`.trim(),
+    color: getD(id).color, cells: metricCells(th[id], baseOn, false),
+  }));
+  return { columns: COMPARE_COLUMNS, rows, refs, ready: rows.every((r) => !r.pending) };
+}
+
+/** Difference text for a sensitivity cell (°C / kWh / %p). */
+export function fmtDelta(col, d) {
+  if (!isNum(d)) return '';
+  if (col.key === 'savingPct') return `${fmtSigned(d, 1)}%p`;
+  return fmtSigned(d, col.digits ?? 1);
+}
+
+/** Concept section of B's screw joint (추가 수정 요청 1-3 (2)): head / EPDM washer / ACP 4T / roof steel 1.2T. */
+export function fastenerDetailSvg(uid = 'a') {
+  const pat = `fx-hatch-${String(uid).replace(/[^\w-]/g, '')}`;
+  let thread = '';
+  for (let y = 72; y < 114; y += 5) thread += `M105 ${y}L101.5 ${y + 2.5}L105 ${y + 5}M115 ${y}L118.5 ${y + 2.5}L115 ${y + 5}`;
+  return `<svg viewBox="0 0 356 152" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="B안 체결부 단면 상세 개념도: 위에서부터 직결피스 머리, EPDM 고무 와셔, ACP 패널 4T, 기존 지붕 강판 1.2T. 피스가 ACP 패널과 기존 지붕 강판을 관통합니다.">
+<defs><pattern id="${pat}" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="currentColor" stroke-opacity="0.16" stroke-width="2"/></pattern></defs>
+<rect x="12" y="99" width="200" height="34" fill="url(#${pat})"/>
+<text x="18" y="127" font-size="10" fill="currentColor" fill-opacity="0.62">실내측</text>
+<rect x="12" y="92" width="200" height="7" fill="#8d949b" stroke="currentColor" stroke-width="0.8"/>
+<rect x="12" y="70" width="200" height="22" fill="#2b2f34" stroke="currentColor" stroke-width="0.8"/>
+<rect x="12.4" y="70.4" width="199.2" height="4.4" fill="#f6f7f9"/>
+<rect x="12.4" y="87.4" width="199.2" height="4.2" fill="#cfd5db"/>
+<rect x="105" y="58" width="10" height="60" fill="#b8bec5" stroke="currentColor" stroke-width="0.8"/>
+<path d="${thread}" fill="none" stroke="currentColor" stroke-width="0.7"/>
+<path d="M105 118L110 128L115 118Z" fill="#b8bec5" stroke="currentColor" stroke-width="0.8" stroke-linejoin="round"/>
+<rect x="82" y="62" width="56" height="8" rx="2" fill="#1c1e22" stroke="currentColor" stroke-width="0.6"/>
+<rect x="88" y="58" width="44" height="4" fill="#c9ced3" stroke="currentColor" stroke-width="0.8"/>
+<rect x="95" y="38" width="30" height="20" fill="#d5dade" stroke="currentColor" stroke-width="0.8"/>
+<path d="M103 38v20M117 38v20" stroke="currentColor" stroke-width="0.6" stroke-opacity="0.6"/>
+<g fill="none" stroke="currentColor" stroke-width="0.8">
+<path d="M126 44H216"/><path d="M139 66H216"/><path d="M196 80L216 88"/><path d="M196 96L216 112"/>
+</g>
+<g font-size="11.5" fill="currentColor">
+<text x="220" y="48">① 방수 직결피스 머리</text>
+<text x="220" y="70">② EPDM 고무 와셔 (방수)</text>
+<text x="220" y="92">③ ACP 패널 4T</text>
+<text x="220" y="116">④ 기존 지붕 강판 1.2T</text>
+</g>
+<text x="12" y="147" font-size="10" fill="currentColor" fill-opacity="0.72">공기층 0 mm · 피스가 ACP 패널과 기존 지붕 강판을 관통 (규격·간격 미확정 개념도)</text>
+</svg>`;
 }
 
 const xy = (hours, arr) => hours.map((h, i) => ({ x: h, y: isNum(arr?.[i]) ? arr[i] : null }));
@@ -174,36 +296,45 @@ const xy = (hours, arr) => hours.map((h, i) => ({ x: h, y: isNum(arr?.[i]) ? arr
  * Compares A, B, C, C′ simultaneously + ambient air temperature.
  * Automatically switches between AC OFF and AC ON curves based on `acOn`.
  */
-export function buildTempSeries(thermal, { design = 'C', acOn = false, viewTab = 'both', visible = {} } = {}, config = {}) {
+export const CP_BASE_SERIES_ALPHA = 0.45;
+
+export function buildTempSeries(thermal, { design = 'C', acOn = false, viewTab = 'both', visible = {}, cpBase = null } = {}, config = {}) {
   const getD = (id) => (typeof config.getDesign === 'function' ? config.getDesign(id) : (id === 'A' ? config.BASELINE : config.DESIGNS?.[id])) || {};
   const all = config.ALL_IDS || ['A', 'B', 'C', 'Cp'];
   const branch = acOn ? 'on' : 'off';
   const out = [];
   let airSrc = null;
 
-  for (const id of all) {
-    const entry = thermal?.[id];
-    const r = entry?.[branch] || entry;
-    if (!r || !Array.isArray(r.hours)) continue;
-    airSrc = airSrc || r;
-    if (visible[id] === false) continue;
-    const d = getD(id);
-    const emph = id === design;
-    const color = d.color || null;
-    const nm = shortName(id);
+  const push = (id, r, { label, color, emph, faint = false }) => {
     if (viewTab === 'roof' || viewTab === 'both') {
       out.push({
-        id, key: `${id}:roof`, kind: 'roof', label: `${nm} 지붕 강판 하면`,
-        color, order: emph ? 0 : 1, dash: [], width: emph ? 2.8 : 1.9,
+        id, key: `${id}:roof`, kind: 'roof', label: `${label} 지붕 강판 하면`,
+        color, order: emph ? 0 : 1, dash: [], width: emph ? 2.8 : faint ? 1.6 : 1.9,
         data: xy(r.hours, r.TroofBot || r.Troof),
       });
     }
     if (viewTab === 'indoor' || viewTab === 'both') {
       out.push({
-        id, key: `${id}:indoor`, kind: 'indoor', label: `${nm} 실내 공기`,
-        color, order: emph ? 0 : 1, dash: viewTab === 'both' ? [7, 4] : [], width: emph ? 2.4 : 1.7,
+        id, key: `${id}:indoor`, kind: 'indoor', label: `${label} 실내 공기`,
+        color, order: emph ? 0 : 1, dash: viewTab === 'both' ? [7, 4] : [], width: emph ? 2.4 : faint ? 1.5 : 1.7,
         data: xy(r.hours, r.Tin),
       });
+    }
+  };
+
+  for (const id of all) {
+    const entry = thermal?.[id];
+    const r = entry?.[branch] || entry;
+    if (!r || !Array.isArray(r.hours)) continue;
+    airSrc = airSrc || r;
+    if (visible[id] !== false) push(id, r, { label: shortName(id), color: getD(id).color || null, emph: id === design });
+    // Original C′ next to the adjusted one (same colour, faded) for the before/after comparison
+    if (id === 'Cp' && cpBase && visible.CpBase !== false) {
+      const rb = cpBase[branch] || cpBase;
+      if (rb && Array.isArray(rb.hours)) {
+        const c = getD('Cp').color;
+        push('CpBase', rb, { label: 'C′안(기존 물성)', color: c ? withAlpha(c, CP_BASE_SERIES_ALPHA) : null, emph: false, faint: true });
+      }
     }
   }
   if (visible.air !== false && airSrc) {
@@ -345,6 +476,21 @@ export function buildCsv(compareModel, meta = {}) {
     lines.push(['설계안 명칭', ...cols.map((c) => `${c.label} (${c.unit})`)]);
     for (const r of compareModel.rows) lines.push([r.name, ...cols.map((c) => r.cells?.[c.key]?.text ?? '')]);
   }
+  const sens = meta.sensitivity;
+  if (sens && Array.isArray(sens.rows) && sens.rows.length) {
+    const cols = sens.columns || COMPARE_COLUMNS;
+    lines.push([]);
+    lines.push(['C′안 표면 물성 민감도 (추가 시뮬레이션 후보 조건)']);
+    lines.push(['조건', '상부 태양광 반사율', '상부 태양광 흡수율', '하부 장파 방사율', ...cols.map((c) => `${c.label} (${c.unit})`)]);
+    for (const r of [...sens.rows, ...(sens.refs || [])]) {
+      const s = r.surface;
+      lines.push([
+        r.name,
+        s ? s.rhoSolar.toFixed(2) : '', s ? (1 - s.rhoSolar).toFixed(2) : '', s ? s.epsBottom.toFixed(2) : '',
+        ...cols.map((c) => r.cells?.[c.key]?.text ?? ''),
+      ]);
+    }
+  }
   if (meta.conditions) { lines.push([]); lines.push(['해석 조건', meta.conditions]); }
   return `\uFEFF${lines.map((r) => r.map(csvCell).join(',')).join('\r\n')}\r\n`;
 }
@@ -397,7 +543,7 @@ function lsSet(k, v) { try { globalThis.localStorage?.setItem(k, v); } catch { /
 const DEFAULT_LEGEND_CSS = 'linear-gradient(90deg, #313695, #4575b4, #74add1, #abd9e9, #fee090, #fdae61, #f46d43, #d73027, #a50026)';
 
 // ================================================================ createUI
-export function createUI({ state, set, config, legend, getState, scenario } = {}) {
+export function createUI({ state, set, config, legend, getState, scenario, designOf } = {}) {
   if (typeof document === 'undefined') throw new Error('createUI() needs a DOM');
   const cfg = config || {};
   const S = () => (typeof getState === 'function' ? getState() : state) || {};
@@ -405,6 +551,15 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
   const SITES = cfg.SITES || [];
   const PRESETS = cfg.WEATHER_PRESETS || [];
   const getD = (id) => (typeof cfg.getDesign === 'function' ? cfg.getDesign(id) : (id === 'A' ? cfg.BASELINE : cfg.DESIGNS?.[id])) || {};
+  // Design as currently simulated (C′ carries the adjusted surface texts); falls back to the static spec.
+  const effD = (id) => {
+    if (typeof designOf === 'function') {
+      try { const d = designOf(id); if (d) return d; } catch (e) { console.error('[ui] designOf failed', e); }
+    }
+    return getD(id);
+  };
+  const CPC = cfg.CP_CANDIDATES || [];
+  const CP_DEF = cfg.CP_SURFACE_DEFAULT || { rhoSolar: 0.75, epsBottom: 0.28 };
   const SPEC = cfg.CUSTOM_SPEC || CFG.CUSTOM_SPEC || {};
   const spec = (path) => SPEC[path] || {};
   const DEFAULTS = customDefaultMap({ CUSTOM_SPEC: SPEC, customDefaults: cfg.customDefaults || CFG.customDefaults });
@@ -419,7 +574,7 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
 
   let themePref = applyThemePref(document.documentElement, lsGet(THEME_KEY));
 
-  const results = { thermal: null };
+  const results = { thermal: null, cpBase: null, cpCandidates: null, cpSurface: null, cpAdjusted: false };
   let resultsVersion = 0;
   let install = { running: false, mode: 'install', stepIndex: -1, steps: [], elapsedMin: 0, totalMin: 0 };
   let assumptions = { thermal: [] };
@@ -428,7 +583,7 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
   let legendState = legend || null;
   let busy = false;
   let tempTab = 'both';
-  const visible = { A: true, B: true, C: true, Cp: true, air: true };
+  const visible = { A: true, B: true, C: true, Cp: true, CpBase: true, air: true };
 
   const binders = [];
   const lastEdit = new WeakMap();
@@ -635,7 +790,12 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
     hud.install = h('div', { class: 'hud-bc hud-panel', id: 'hud-install', hidden: true, role: 'status', 'aria-live': 'polite' },
       h('div', { class: 'hud-install-top' }, hud.instStep, hud.instTime), hud.instTitle, h('div', { class: 'bar' }, hud.instBar));
 
-    hudRoot.append(tl, tr, bl, hud.install);
+    // B안 "상세" view: concept section of the screw joint next to the 3D close-up (추가 수정 요청 1-3 (2))
+    hud.detail = h('figure', { class: 'hud-br hud-panel hud-detail', id: 'hud-fastener', hidden: true },
+      h('figcaption', { class: 'hud-detail-title', text: 'B안 체결부 단면 상세 (개념도)' }),
+      h('div', { class: 'fastener-svg', html: fastenerDetailSvg('hud') }));
+
+    hudRoot.append(tl, tr, bl, hud.install, hud.detail);
     applyLegend();
   }
 
@@ -813,6 +973,8 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
     binders.push((st) => setText(secRoof.sum, `단열 ${st.roof?.insulationMm ?? 0}mm · ${st.interior?.acOn ? `냉방 ON (${fmtNum(st.interior?.setpoint, 0)}°C)` : '냉방 OFF'}`));
     trackChanges(secRoof, ['roof.insulationMm', 'interior.setpoint']);
 
+    const secCp = buildCpSection();
+
     // 3D display & Install / Disassemble animation (§10)
     const VIEW = [
       ['heatmap', '지붕 열지도'], ['flow', '공기층 기류'], ['rays', '태양광선'],
@@ -870,10 +1032,69 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
     const secScen = buildScenarioSection();
 
     const small = typeof matchMedia === 'function' && matchMedia('(max-width: 700px)').matches;
-    const secs = [secDesign, secTime, secWeather, secRoof, secView, secApp, secScen].filter(Boolean);
+    const secs = [secDesign, secTime, secWeather, secRoof, secCp, secView, secApp, secScen].filter(Boolean);
     if (small) for (const s of [secWeather, secApp, secScen]) if (s && lsGet(`kroof.ui.sec.${s.det.id}`) === null) s.det.open = false;
 
     controlsRoot.append(modeBlock, h('div', { class: 'ctl-flow' }, secs.map((s) => s.det)));
+  }
+
+  // C′안 surface-property controls (추가 수정 요청 2-4). Touching them selects C′ so the KPI tiles follow.
+  const cpPatch = (part) => (S().design === 'Cp' ? { cpSurface: part } : { cpSurface: part, design: 'Cp' });
+  const applyCp = (surface) => doSet(cpPatch({ rhoSolar: surface.rhoSolar, epsBottom: surface.epsBottom }));
+
+  function buildCpSection() {
+    const preset = h('select', { id: 'ctl-cp-preset' },
+      CPC.map((c) => h('option', { value: c.id, text: `${c.name} (${surfaceShort(c)})` })),
+      h('option', { value: 'custom', text: '사용자 지정', disabled: true }));
+    preset.addEventListener('change', () => {
+      const c = CPC.find((x) => x.id === preset.value);
+      if (!c) return;
+      applyCp(c);
+      toast(`C′안 ${c.name} 조건 적용 (${surfaceShort(c)})`);
+    });
+    binders.push((st) => {
+      if (document.activeElement === preset) return;
+      const c = CPC.find((x) => sameSurface(x, st.cpSurface));
+      const v = c ? c.id : 'custom';
+      if (preset.value !== v) preset.value = v;
+    });
+
+    const rho = rangeField({
+      id: 'ctl-cp-rho', label: '상부 태양광 반사율 ρ', min: 0.5, max: 0.95, step: 0.01, heavy: true,
+      get: (st) => st.cpSurface?.rhoSolar ?? CP_DEF.rhoSolar,
+      fmt: (v) => ({ text: fmtNum(v, 2), alt: `흡수율 α ${fmtNum(1 - v, 2)}` }),
+      patch: (v) => cpPatch({ rhoSolar: v }),
+    });
+    const eps = rangeField({
+      id: 'ctl-cp-eps', label: '하부 장파 방사율 ε', min: 0.05, max: 0.9, step: 0.01, heavy: true,
+      get: (st) => st.cpSurface?.epsBottom ?? CP_DEF.epsBottom,
+      fmt: (v) => fmtNum(v, 2),
+      patch: (v) => cpPatch({ epsBottom: v }),
+    });
+    const reset = h('button', { type: 'button', class: 'btn btn-full', id: 'btn-cp-reset', text: `기존 C′안 값으로 복원 (${surfaceShort(CP_DEF)})` });
+    reset.addEventListener('click', () => { applyCp(CP_DEF); toast('C′안 물성값을 기존 값으로 복원했습니다'); });
+
+    const alphaOut = h('dd', { id: 'out-cp-alpha', class: 'num' });
+    const fixed = h('dl', { class: 'cp-fixed' },
+      h('div', null, h('dt', { text: '상부 태양광 흡수율' }), alphaOut),
+      h('div', null, h('dt', { text: '상부 장파 방사율' }), h('dd', { class: 'num', text: '0.88 (고정)' })),
+      h('div', null, h('dt', { text: '갈바륨 0.5T · 공기층' }), h('dd', { text: '기존과 동일 (140 mm)' })));
+    binders.push((st) => setText(alphaOut, `${fmtNum(1 - (st.cpSurface?.rhoSolar ?? CP_DEF.rhoSolar), 2)} (= 1 − ρ)`));
+
+    const sec = section({
+      id: 'sec-cp', title: 'C′안 표면 물성 조절', body: [
+        h('p', { class: 'table-note', text: '기존 C′안의 구조를 유지하고 상부 반사율·하부 방사율만 바꿔 열성능 개선 가능성을 확인합니다. 값을 바꾸면 C′안의 온도 그래프와 결과가 다시 계산됩니다.' }),
+        h('div', { class: 'field' }, h('label', { for: 'ctl-cp-preset', text: '추가 시뮬레이션 후보 조건' }), preset),
+        rho.field, eps.field, fixed, reset,
+        h('p', { class: 'table-note', text: '후보값은 최종 확정값이 아닌 민감도 분석용입니다. 결과 비교는 아래 「C′안 표면 물성 민감도 분석」 표를 참고하세요.' }),
+      ],
+    });
+    binders.push((st) => {
+      const c = CPC.find((x) => sameSurface(x, st.cpSurface));
+      setText(sec.sum, `${c && c.id !== 'base' ? `${c.short} · ` : ''}${surfaceShort(st.cpSurface || CP_DEF)}`);
+    });
+    trackChanges(sec, ['cpSurface.rhoSolar', 'cpSurface.epsBottom']);
+    return sec;
   }
 
   function buildScenarioSection() {
@@ -959,7 +1180,8 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
     const compare = buildCompareRows(cfg, results);
     const w = st.weather || {};
     const csv = buildCsv(compare, {
-      conditions: `${siteName(st.siteId)} · ${fmtDate(st.month, st.day)} · 기온 ${fmtPlain(w.Tmax)}/${fmtPlain(w.Tmin)} °C · 풍속 ${fmtPlain(w.windSpeed)} m/s · 맑음 ${fmtPlain(w.clearness)} · 단열 ${st.roof?.insulationMm ?? 0} mm · 냉방 설정 ${fmtPlain(st.interior?.setpoint)} °C`,
+      conditions: `${siteName(st.siteId)} · ${fmtDate(st.month, st.day)} · 기온 ${fmtPlain(w.Tmax)}/${fmtPlain(w.Tmin)} °C · 풍속 ${fmtPlain(w.windSpeed)} m/s · 맑음 ${fmtPlain(w.clearness)} · 단열 ${st.roof?.insulationMm ?? 0} mm · 냉방 설정 ${fmtPlain(st.interior?.setpoint)} °C · C′안 ${surfaceShort(results.cpSurface || st.cpSurface || CP_DEF)}`,
+      sensitivity: buildSensitivityRows(cfg, results),
     });
     const p2 = (n) => String(n).padStart(2, '0');
     const fileName = `kroof-${st.siteId || 'site'}-${p2(st.month)}${p2(st.day)}.csv`;
@@ -974,12 +1196,12 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
 
   function triggerInstall() {
     const st = S();
-    if (st.design === 'A') { toast('A안은 추가 차열 구조물이 없는 기준 모델입니다. C안 또는 C′안을 선택하세요.'); return; }
+    if (st.design === 'A') { toast('A안은 추가 차열 구조물이 없는 기준 모델입니다. B안, C안 또는 C′안을 선택하세요.'); return; }
     doSet({ actions: { installSeq: (st.actions?.installSeq || 0) + 1 } });
   }
   function triggerDisassemble() {
     const st = S();
-    if (st.design === 'A') { toast('A안은 해체할 차열 구조물이 없습니다. C안 또는 C′안을 선택하세요.'); return; }
+    if (st.design === 'A') { toast('A안은 해체할 차열 구조물이 없습니다. B안, C안 또는 C′안을 선택하세요.'); return; }
     doSet({ actions: { disassembleSeq: (st.actions?.disassembleSeq || 0) + 1 } });
   }
   function triggerRestore() {
@@ -1023,8 +1245,15 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
     dash.acChartBtn = h('button', { type: 'button', class: 'btn btn-sm', id: 'btn-chart-ac', 'aria-pressed': 'false', text: '그래프: 냉방 OFF' });
     dash.acChartBtn.addEventListener('click', () => doSet({ interior: { acOn: !S().interior?.acOn } }));
 
+    const cpBaseColor = getD('Cp').color ? withAlpha(getD('Cp').color, CP_BASE_SERIES_ALPHA) : null;
+    const chipDefs = [];
+    for (const id of ALL) {
+      chipDefs.push([id, shortName(id), getD(id).color]);
+      if (id === 'Cp') chipDefs.push(['CpBase', 'C′안 기존 물성', cpBaseColor]);
+    }
+    chipDefs.push(['air', '외기온도', null]);
     const visWrap = h('div', { class: 'series-toggles', role: 'group', 'aria-label': '곡선 표시/숨김' },
-      [...ALL.map((id) => [id, shortName(id), getD(id).color]), ['air', '외기온도', null]].map(([k, label, col]) => {
+      chipDefs.map(([k, label, col]) => {
         const chip = col ? `<span class="sw-chip" style="--c:${esc(col)}"></span>` : '';
         const b = h('button', {
           type: 'button', class: 'stog', id: `tog-series-${k}`, 'aria-pressed': String(visible[k] !== false),
@@ -1035,6 +1264,7 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
           b.setAttribute('aria-pressed', String(visible[k]));
           renderTemp(S(), true);
         });
+        if (k === 'CpBase') { b.hidden = true; dash.cpBaseChip = b; }   // only while C′ is adjusted
         return b;
       }));
 
@@ -1076,7 +1306,40 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
       head('설계안별 최종 비교표 (A안 · B안 · C안 · C′안)', '행을 클릭하면 3D 뷰 설계안 전환', 'h-compare'),
       h('div', { class: 'table-wrap dash-data' }, cmpTable), dash.cmpNote);
 
-    // Structural specification comparison table
+    // C′ surface-property sensitivity (추가 수정 요청 2-3): candidates × the same 5 metrics
+    dash.sensBody = h('tbody');
+    const sensHead = h('thead', null,
+      h('tr', null,
+        h('th', { class: 'sticky-col', scope: 'col', rowspan: '2' }, '조건'),
+        h('th', { class: 'grp', colspan: '2', text: 'C′안 표면 물성' }),
+        h('th', { class: 'grp', colspan: String(offCols), text: '냉방 OFF 조건 (24시간)' }),
+        h('th', { class: 'grp on', colspan: String(onCols), text: '냉방 ON 조건 (08:00~18:00)' })),
+      h('tr', null,
+        h('th', { scope: 'col' }, '상부 반사율 ρ', h('small', { text: '흡수율 α' })),
+        h('th', { scope: 'col' }, '하부 방사율 ε', h('small', { text: '장파' })),
+        COMPARE_COLUMNS.map((c, i) => h('th', {
+          scope: 'col', class: c.group === 'on' && COMPARE_COLUMNS[i - 1]?.group === 'off' ? 'col-on-first' : null,
+        }, c.label, c.unit ? h('small', { text: c.unit }) : null))));
+    const sensTable = h('table', { class: 'cmp sens', id: 'sens-table' },
+      h('caption', { class: 'sr', text: 'C′안 표면 물성 후보 조건별 결과 (괄호: 기존 C′안 대비 변화)' }), sensHead, dash.sensBody);
+    const pickCand = (tr) => {
+      const c = CPC.find((x) => x.id === tr.dataset.cand);
+      if (!c) return;
+      applyCp(c);
+      toast(`C′안 ${c.name} 조건 적용 (${surfaceShort(c)})`);
+    };
+    dash.sensBody.addEventListener('click', (e) => { const tr = e.target.closest('tr[data-cand]'); if (tr) pickCand(tr); });
+    dash.sensBody.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const tr = e.target.closest('tr[data-cand]');
+      if (tr) { e.preventDefault(); pickCand(tr); }
+    });
+    dash.sensNote = h('p', { class: 'table-note', id: 'sens-note' });
+    const secSens = h('section', { class: 'dash-sec', id: 'sec-cp-sens', 'aria-labelledby': 'h-sens' },
+      head('C′안 표면 물성 민감도 분석 (추가 시뮬레이션 후보 6종)', '행 클릭: 해당 물성값 적용 · 괄호: 기존 C′안 대비', 'h-sens'),
+      h('div', { class: 'table-wrap dash-data' }, sensTable), dash.sensNote);
+
+    // Structural specification comparison table (last 3 rows: drilling / reuse comparison, 추가 수정 요청 §1)
     const SPEC_FIELDS = [
       ['panel', '차열패널'],
       ['gapMm', '공기층 높이'],
@@ -1089,9 +1352,16 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
       ['tieDown', '컨테이너 결속'],
       ['auxFix', '보조 고정 부품'],
       ['installType', '설치 방식'],
+      ['roofDrilling', '기존 지붕 천공'],
+      ['afterRemoval', '해체 후 기존 지붕'],
+      ['panelReuse', '패널 재사용'],
     ];
+    const specCells = [];
     const specBody = h('tbody', null, SPEC_FIELDS.map(([k, label]) =>
-      h('tr', null, h('th', { scope: 'row', text: label }), ...ALL.map((id) => h('td', { text: getD(id).specs?.[k] || '—' })))));
+      h('tr', { class: ['roofDrilling', 'afterRemoval', 'panelReuse'].includes(k) ? 'spec-reuse' : null },
+        h('th', { scope: 'row', text: label }),
+        ...ALL.map((id) => { const td = h('td', { text: getD(id).specs?.[k] || '—' }); specCells.push([td, id, k]); return td; }))));
+    binders.push(() => { for (const [td, id, k] of specCells) setText(td, effD(id).specs?.[k] || '—'); });
     const specTable = h('table', { class: 'spec-table', id: 'spec-table' },
       h('thead', null, h('tr', null, h('th', { text: '구분' }), ...ALL.map((id) => h('th', { text: `${shortName(id)} (${getD(id).name})` })))),
       specBody);
@@ -1123,24 +1393,43 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
         h('p', { class: 'assume-note', text: '본 시뮬레이션은 동일한 대표 여름 기상 조건에서 A안·B안·C안·C′안의 상대적 열성능을 객관적으로 비교하기 위한 1차원 과도 열수지 해석입니다. 상세 경제성 분석 및 정밀 구조 안전성(풍하중 안전율·한계풍속) 검토는 별도 수행 범위로 본 계산에서 제외되었습니다.' }),
         dash.assThermal));
 
-    dashRoot.append(rowTop, secTemp, secCmp, secSpec, secInstall, assume);
+    dashRoot.append(rowTop, secTemp, secCmp, secSens, secSpec, secInstall, assume);
     renderAssumptions();
     renderInstallList();
   }
 
   let ovSig = null;
   function renderOverview(st) {
-    const sig = `${st.design}|${st.roof?.insulationMm}`;
+    const cs = st.cpSurface || {};
+    const sig = `${st.design}|${st.roof?.insulationMm}|${st.design === 'Cp' ? `${cs.rhoSolar}|${cs.epsBottom}` : ''}`;
     if (sig === ovSig || !dash.ov) return;
     ovSig = sig;
-    const id = st.design, d = getD(id);
+    const id = st.design, d = effD(id);
     const parts = [
       h('div', { class: 'ov-head' },
         h('span', { class: 'dr-id', style: { '--c': d.color }, text: shortName(id) }),
         h('h3', { text: d.fullName || d.name })),
     ];
     if (d.tagline) parts.push(h('p', { class: 'ov-tagline', text: d.tagline }));
+    if (id === 'Cp' && d.surfaceAdjusted && d.surface) {
+      parts.push(h('p', { class: 'ov-adjust', id: 'ov-cp-adjust' },
+        h('span', { class: 'pill warn', text: '물성값 조정 중' }),
+        h('span', { text: ` 상부 ρ ${fmtNum(d.surface.rhoSolar, 2)} (α ${fmtNum(1 - d.surface.rhoSolar, 2)}) · 하부 ε ${fmtNum(d.surface.epsBottom, 2)} — 기존 ${surfaceShort(CP_DEF)}` })));
+    }
     if (d.description) parts.push(h('p', { class: 'ov-desc', text: d.description }));
+    if (d.features && Array.isArray(d.features.items) && d.features.items.length) {
+      parts.push(h('div', { class: 'ov-features', id: 'ov-features' },
+        h('h4', { text: d.features.title || '설치 방식 특징' }),
+        h('ul', null, d.features.items.map((f) => h('li', { class: `feat feat-${f.tone || 'neutral'}`, text: f.text }))),
+        d.features.note ? h('p', { class: 'table-note', text: d.features.note }) : null));
+    }
+    if (id === 'B') {
+      parts.push(h('figure', { class: 'ov-fastener', id: 'ov-fastener' },
+        h('div', { class: 'fastener-svg', html: fastenerDetailSvg('ov') }),
+        h('figcaption', null,
+          h('span', { text: '체결부 단면 상세 (개념도) — 상부부터 ① 직결피스 머리 ② EPDM 고무 와셔 ③ ACP 패널 4T ④ 기존 지붕 강판 1.2T' }),
+          h('button', { type: 'button', class: 'btn btn-sm', id: 'btn-fastener-3d', text: '3D 체결부 확대 보기', onclick: () => doSet({ camera: 'detail' }) }))));
+    }
     if (Array.isArray(d.callouts) && d.callouts.length) {
       parts.push(h('ol', { class: 'ov-callouts', 'aria-label': '부품 구성' },
         d.callouts.map((c) => h('li', null, h('span', { class: 'cn', 'aria-hidden': 'true', text: String(c.n) }),
@@ -1152,15 +1441,19 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
 
   function renderKpis(st) {
     if (!dash.kpi) return;
-    const tiles = computeKpis({ sel: st.design, thermal: results.thermal, setpoint: st.interior?.setpoint ?? 26 });
+    const tiles = computeKpis({
+      sel: st.design, thermal: results.thermal, setpoint: st.interior?.setpoint ?? 26,
+      cpBase: results.cpAdjusted ? results.cpBase : null,
+    });
     dash.kpi.innerHTML = tiles.map((t) => {
       const val = t.empty ? '<span class="skel" aria-label="계산 중"></span>'
         : `<span class="v">${esc(fmtNum(t.value, t.digits))}</span><span class="u">${esc(t.unit)}</span>`;
       const delta = t.empty ? '<span class="muted">계산 중…</span>' : esc(t.deltaText || '');
+      const cmp = !t.empty && t.cmpText ? `<div class="kpi-delta kpi-cmp ${t.cmpTone || ''}">${esc(t.cmpText)}</div>` : '';
       return `<div class="kpi" data-key="${t.key}">
         <div class="kpi-top"><span class="kpi-label">${esc(t.label)}</span><span class="src">계산값</span></div>
         <div class="kpi-value">${val}</div>
-        <div class="kpi-delta ${t.tone || ''}">${delta}</div>
+        <div class="kpi-delta ${t.tone || ''}">${delta}</div>${cmp}
         <div class="kpi-sub"><span>${esc(t.sub || '')}</span></div>
       </div>`;
     }).join('');
@@ -1192,15 +1485,22 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
       dash.acChartBtn.textContent = acOn ? `그래프: 냉방 ON (${fmtPlain(st.interior?.setpoint ?? 26)}°C)` : '그래프: 냉방 OFF';
     }
 
-    const series = buildTempSeries(results.thermal, { design: st.design, acOn, viewTab: tempTab, visible }, cfg);
+    const cpBase = results.cpAdjusted ? results.cpBase : null;
+    if (dash.cpBaseChip && dash.cpBaseChip.hidden === !!cpBase) dash.cpBaseChip.hidden = !cpBase;
+    const series = buildTempSeries(results.thermal, { design: st.design, acOn, viewTab: tempTab, visible, cpBase }, cfg);
     const has = series.length > 0;
     dash.tempEmpty.hidden = has && chartsAvailable();
     if (has) dash.tempEmpty.textContent = '계산 중…';
 
     const ids = [...new Set(series.filter((s) => s.id !== 'air').map((s) => s.id))];
     dash.tempLegend.innerHTML = ids.map((id) => {
-      const d = getD(id);
-      return `<span class="${id === st.design ? 'lg-emph' : ''}"><span class="sw-chip" style="--c:${esc(d.color)}"></span>${esc(shortName(id))} ${esc(d.name)}</span>`;
+      if (id === 'CpBase') {
+        const c = getD('Cp').color ? withAlpha(getD('Cp').color, CP_BASE_SERIES_ALPHA) : 'var(--ink-3)';
+        return `<span><span class="sw-chip" style="--c:${esc(c)}"></span>C′안 기존 물성 (${esc(surfaceShort(CP_DEF))})</span>`;
+      }
+      const d = effD(id);
+      const adj = id === 'Cp' && results.cpAdjusted ? ` (${surfaceShort(results.cpSurface)})` : '';
+      return `<span class="${id === st.design ? 'lg-emph' : ''}"><span class="sw-chip" style="--c:${esc(d.color)}"></span>${esc(shortName(id))} ${esc(d.name)}${esc(adj)}</span>`;
     }).join('') + (series.some((s) => s.id === 'air') ? '<span><span class="sw-chip" style="--c:var(--ink-3)"></span>외기온도 (점선)</span>' : '')
       + (tempTab === 'both' ? '<span class="muted">실선: 지붕 강판 하면 · 파선: 실내 공기</span>' : '');
 
@@ -1231,11 +1531,47 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
         ].filter(Boolean).join(' ');
         return `<td${cls ? ` class="${cls}"` : ''}>${esc(cell.text)}</td>`;
       }).join('');
-      return `<tr data-id="${esc(r.id)}" tabindex="0" class="${sel ? 'is-sel' : ''}" aria-selected="${sel}">
-        <td><span class="id-cell"><span class="sw-chip" style="--c:${esc(r.color)}"></span>${esc(r.name)}</span></td>${cells}</tr>`;
+      const rowCls = [sel ? 'is-sel' : '', r.ref ? 'is-ref' : ''].filter(Boolean).join(' ');
+      const chip = r.ref ? `--c:${esc(r.color)};opacity:${CP_BASE_SERIES_ALPHA + 0.15}` : `--c:${esc(r.color)}`;
+      return `<tr data-id="${esc(r.selId || r.id)}" tabindex="0" class="${rowCls}" aria-selected="${sel}">
+        <td><span class="id-cell"><span class="sw-chip" style="${chip}"></span>${esc(r.name)}</span></td>${cells}</tr>`;
     }).join('');
     if (dash.cmpNote) {
-      dash.cmpNote.textContent = `냉방부하는 냉방기 소비전력이 아니라 08:00~18:00 동안 실내 설정온도(${fmtPlain(st.interior?.setpoint ?? 26)}°C)를 유지하기 위해 제거해야 하는 열에너지량(kWh)입니다. 강조된 셀은 동일 항목에서 가장 유리한 수치입니다.`;
+      const adj = results.cpAdjusted ? ' C′안은 조정한 표면 물성값으로 계산되며, 바로 아래 행이 기존 물성값(ρ 0.75 · ε 0.28) 결과입니다.' : '';
+      dash.cmpNote.textContent = `냉방부하는 냉방기 소비전력이 아니라 08:00~18:00 동안 실내 설정온도(${fmtPlain(st.interior?.setpoint ?? 26)}°C)를 유지하기 위해 제거해야 하는 열에너지량(kWh)입니다. 강조된 셀은 동일 항목에서 가장 유리한 수치입니다.${adj}`;
+    }
+  }
+
+  function renderSens(st) {
+    if (!dash.sensBody) return;
+    const model = buildSensitivityRows(cfg, results);
+    const cols = model.columns;
+    const cellHtml = (r, c, i) => {
+      const cell = r.cells[c.key];
+      const cls = [
+        cell.best && r.kind !== 'ref' ? 'best' : '',
+        cell.na ? 'na' : '',
+        c.group === 'on' && cols[i - 1]?.group === 'off' ? 'col-on-first' : '',
+      ].filter(Boolean).join(' ');
+      const d = r.kind !== 'ref' ? fmtDelta(c, cell.delta) : '';
+      return `<td${cls ? ` class="${cls}"` : ''}>${esc(cell.text)}${d ? `<small class="dv">(${esc(d)})</small>` : ''}</td>`;
+    };
+    const surfCells = (s) => (s
+      ? `<td>${esc(fmtNum(s.rhoSolar, 2))}<small class="dv">α ${esc(fmtNum(1 - s.rhoSolar, 2))}</small></td><td>${esc(fmtNum(s.epsBottom, 2))}</td>`
+      : '<td class="na">—</td><td class="na">—</td>');
+    const color = getD('Cp').color;
+    const rowsHtml = model.rows.map((r) => {
+      const cls = [r.current ? 'is-sel' : '', r.kind === 'custom' ? 'is-custom' : ''].filter(Boolean).join(' ');
+      const attrs = r.kind === 'cand' ? ` data-cand="${esc(r.id)}" tabindex="0"` : '';
+      const tag = r.current ? '<span class="pill warn">현재</span>' : '';
+      return `<tr${attrs} class="${cls}" aria-selected="${!!r.current}">
+        <td><span class="id-cell"><span class="sw-chip" style="--c:${esc(color)}"></span>${esc(r.name)} ${tag}</span></td>${surfCells(r.surface)}${cols.map((c, i) => cellHtml(r, c, i)).join('')}</tr>`;
+    });
+    const refHtml = model.refs.map((r) => `<tr class="is-ref" aria-disabled="true">
+        <td><span class="id-cell"><span class="sw-chip" style="--c:${esc(r.color)}"></span>${esc(r.name)}</span></td>${surfCells(null)}${cols.map((c, i) => cellHtml(r, c, i)).join('')}</tr>`);
+    dash.sensBody.innerHTML = [...rowsHtml, ...refHtml].join('');
+    if (dash.sensNote) {
+      dash.sensNote.textContent = `${model.ready ? '' : '후보 조건 계산 중… '}모든 후보의 상부 장파 방사율 0.88, 갈바륨 0.5T 두께·열전도율·밀도·비열, 공기층 140 mm 등 나머지 조건은 기존 C′안과 동일하며 현재 기상·단열(${st.roof?.insulationMm ?? 0} mm)·냉방 설정을 그대로 적용합니다. 괄호 안은 기존 C′안 대비 변화(절감률은 %p)이고, 강조된 셀은 후보 중 가장 유리한 수치입니다. 후보값은 최종 확정값이 아닌 민감도 분석용입니다.`;
     }
   }
 
@@ -1261,7 +1597,7 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
     }));
     const note = st.design === 'C' || st.design === 'Cp'
       ? `${shortName(st.design)}은 무천공 모듈식 탈부착 구조로, 해체 시 결속 해제 후 개별 패널 모듈과 크로스바·받침 부재를 그대로 회수하여 재사용할 수 있습니다.`
-      : 'B안은 공기층 없이 ACP 4T를 직접 밀착하는 구조입니다.';
+      : 'B안은 공기층 없이 ACP 4T를 밀착하고 방수 직결피스(EPDM 와셔)로 ACP 패널과 기존 지붕 강판을 관통 고정합니다. 패널은 회수·재사용할 수 있지만 해체 후 기존 지붕에 천공 흔적이 남아 실링·방수 보수가 필요하며, 반복 체결 시 손상 가능성이 있습니다 (C안·C′안은 무천공).';
     setText(dash.stepsNote, note);
   }
 
@@ -1283,6 +1619,7 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
     safe(renderKpis);
     safe(renderTemp);
     safe(renderCompare);
+    safe(renderSens);
   }
 
   function renderHeader(st) {
@@ -1316,11 +1653,15 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
       }
     }
     for (const [b, v] of hud.cams || []) b.setAttribute('aria-pressed', String(st.camera === v));
+    if (hud.detail) {
+      const show = st.design === 'B' && st.camera === 'detail';
+      if (hud.detail.hidden === show) hud.detail.hidden = !show;
+    }
     if (hud.date) setText(hud.date, `${fmtDate(st.month, st.day)} · ${siteName(st.siteId)}`);
     if (!isNum(clock.hour)) updateClockText(st.hour);
     renderTimeSummary(st);
     renderHeader(st);
-    const sig = [st.mode, st.design, st.interior?.acOn, st.interior?.setpoint, st.roof?.insulationMm].join('|');
+    const sig = [st.mode, st.design, st.interior?.acOn, st.interior?.setpoint, st.roof?.insulationMm, st.cpSurface?.rhoSolar, st.cpSurface?.epsBottom].join('|');
     if (sig !== dashSig) {
       const designChanged = !dashSig || dashSig.split('|')[1] !== st.design;
       dashSig = sig;
@@ -1384,6 +1725,8 @@ export function createUI({ state, set, config, legend, getState, scenario } = {}
   function renderResults(res = {}) {
     if (!res || typeof res !== 'object') return;
     if ('thermal' in res) results.thermal = res.thermal || null;
+    for (const k of ['cpBase', 'cpCandidates', 'cpSurface']) if (k in res) results[k] = res[k] || null;
+    if ('cpAdjusted' in res) results.cpAdjusted = !!res.cpAdjusted;
     resultsVersion++;
     renderStatus();
     scheduleDash();

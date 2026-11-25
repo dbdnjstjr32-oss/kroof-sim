@@ -7,7 +7,7 @@ import { buildContainer } from '../js/container.js';
 import { build as buildB } from '../js/designs/designB.js';
 import { build as buildC } from '../js/designs/designC.js';
 import { build as buildCp } from '../js/designs/designCp.js';
-import { createAnimator } from '../js/viz/animator.js';
+import { createAnimator, disassemblySequence, revealObjects } from '../js/viz/animator.js';
 import { createGapFlow } from '../js/viz/flow.js';
 import { createShadeAnalyzer } from '../js/viz/shade.js';
 import { createRoofHeatmap, tempToRGB } from '../js/viz/heatmap.js';
@@ -61,9 +61,11 @@ for (const id of DESIGN_IDS) {
     return set;
   });
 
-  // Verify every mesh in m.group belongs to exactly one installStep
+  // Verify every mesh in m.group belongs to exactly one installStep (teardown-only reveal objects excepted)
+  const revealMeshes = new Set();
+  for (const o of revealObjects(m)) o.traverse((n) => { if (n.isMesh) revealMeshes.add(n); });
   const allMeshes = [];
-  m.group.traverse((n) => { if (n.isMesh) allMeshes.push(n); });
+  m.group.traverse((n) => { if (n.isMesh && !revealMeshes.has(n)) allMeshes.push(n); });
   check(allMeshes.length > 0, `${id}: builds meshes (${allMeshes.length})`);
   const uncovered = allMeshes.filter((mesh) => !stepMeshSets.some((set) => set.has(mesh)));
   const duplicated = allMeshes.filter((mesh) => stepMeshSets.filter((set) => set.has(mesh)).length > 1);
@@ -109,15 +111,42 @@ for (const id of DESIGN_IDS) {
   check(intruding.length === 0, `${id}: zero roof-assembly penetration into container interior (${intruding.join(', ')})`);
 }
 
-// Specific checks for B (0mm contact)
+// Specific checks for B (0mm contact + waterproof self-drilling screws through the roof plate)
 {
   const mB = models.B;
   check(mB.gap === null, 'B: gap is null (0mm direct contact)');
-  check(mB.callouts.length === 3, 'B: 3 callouts');
-  check(mB.installSteps.length === 1, 'B: 1 install step');
-  const boxB = new THREE.Box3().setFromObject(mB.group);
-  check(boxB.min.y >= CONTAINER.roofY - 0.005 && boxB.max.y <= 2.83, `B panels flush on roof (${boxB.min.y.toFixed(3)}..${boxB.max.y.toFixed(3)})`);
+  check(mB.callouts.length === 4, `B: 4 callouts incl. screw fixing (${mB.callouts.length})`);
+  check(mB.callouts[3].text.includes('직결피스'), 'B: callout 4 names the waterproof screws');
+  check(mB.installSteps.length === 4, `B: 4 install steps (${mB.installSteps.length})`);
+  check(mB.installSteps[0].objects.length === 0 && mB.installSteps[2].objects.length === 12, 'B install: 1 exposed roof, 3 screws panel by panel');
+  check(mB.disassembleSteps?.length === 4, 'B: 4 custom teardown steps');
+  check(mB.disassembleSteps[2].reveal?.includes(mB.drillMarks) && mB.disassembleSteps[3].reveal?.includes(mB.repairMarks),
+    'B teardown: step 3 reveals drill holes, step 4 the repair markers');
+
+  const panelBox = new THREE.Box3();
+  for (const key of ['acp', 'seal']) for (const o of mB.parts.find((p) => p.key === key).objects) panelBox.expandByObject(o);
+  check(panelBox.min.y >= CONTAINER.roofY - 0.005 && panelBox.max.y <= 2.83, `B panels flush on roof (${panelBox.min.y.toFixed(3)}..${panelBox.max.y.toFixed(3)})`);
   check(mB.topSurfaces.length === 12, `B: 12 ACP topSurfaces (${mB.topSurfaces.length})`);
+
+  const f = mB.fastener;
+  const screwPart = mB.parts.find((p) => p.key === 'screw');
+  check(f && f.count === 96 && f.points.length === 96 && f.perModule === 8, `B: 96 screws, 8 per ACP module (${f?.count})`);
+  check(screwPart && screwPart.objects.length === 12, 'B: one screw group per module');
+  check(f.headTopY > f.panelTopY && f.shankBottomY < f.plateBottomY,
+    `B: screw head above the panel and drill point below the roof plate (${f.headTopY.toFixed(4)} / ${f.shankBottomY.toFixed(4)} < ${f.plateBottomY.toFixed(4)})`);
+  check(f.points.every(([x, z]) => Math.abs(x) < CONTAINER.L / 2 - 0.02 && Math.abs(z) < CONTAINER.W / 2 - 0.02), 'B: every screw lands inside the roof footprint');
+  const screwBox = new THREE.Box3();
+  for (const o of screwPart.objects) screwBox.expandByObject(o);
+  check(screwBox.min.y < CONTAINER.roofY - 0.008 && screwBox.max.y > f.panelTopY,
+    `B: screw geometry spans panel top to below the roof plate (${screwBox.min.y.toFixed(3)}..${screwBox.max.y.toFixed(3)})`);
+  const instCount = (g) => { let n = 0; g.traverse((o) => { if (o.isInstancedMesh) n = Math.max(n, o.count); }); return n; };
+  check(instCount(mB.drillMarks) === 96 && instCount(mB.repairMarks) === 96, 'B: one drill mark + repair ring per screw');
+  check(mB.drillMarks.visible === false && mB.repairMarks.visible === false, 'B: roof marks hidden while installed');
+  const shaded = new Set(mB.shadeMeshes);
+  let leaked = 0;
+  for (const o of [...screwPart.objects, mB.drillMarks, mB.repairMarks]) o.traverse((n) => { if (n.isMesh && shaded.has(n)) leaked++; });
+  check(leaked === 0, 'B: screws and roof marks excluded from sun-shading meshes');
+  check(mB.notices.length === 2 && mB.notices.every((n) => n.anchor && n.showWith), 'B: 2 teardown notices tied to the roof marks');
 }
 
 // Specific checks for C (110mm) and Cp (140mm): straps, channels, callouts, install steps
@@ -163,6 +192,53 @@ for (const id of INSTALL_IDS) {
 
   anim.restoreAssembled(mC);
   check(mC.installSteps.every((s) => s.objects.every((o) => o.visible === true)), 'restoreAssembled restores all parts visible');
+  check(disassemblySequence(mC).every((s) => s.title.startsWith('해체 · ')) && disassemblySequence(mC).length === mC.installSteps.length,
+    'C teardown is still the reversed install sequence');
+}
+
+// 3b. B: drilled install → teardown leaves drill holes + repair markers → restore
+{
+  const anim = createAnimator();
+  const mB = models.B;
+  const screws = mB.parts.find((p) => p.key === 'screw').objects;
+  const panels = mB.parts.find((p) => p.key === 'acp').objects;
+  const baseY = screws.map((o) => o.position.y);
+  const run = () => { for (let i = 0; i < 4000 && anim.isAnimating(mB); i++) anim.update(0.05); };
+
+  const seenInst = new Set();
+  let minScrewY = Infinity;
+  anim.playInstall(mB, { speed: 2, onStep: (i) => seenInst.add(i) });
+  for (let i = 0; i < 4000 && anim.isAnimating(mB); i++) {
+    anim.update(0.05);
+    screws.forEach((o, k) => { if (o.visible) minScrewY = Math.min(minScrewY, o.position.y - baseY[k]); });
+  }
+  check(seenInst.size === 4, `B install visited all 4 steps (${seenInst.size})`);
+  check(screws.every((o, i) => o.visible && Math.abs(o.position.y - baseY[i]) < 1e-9), 'B install: screws end seated in their holes');
+  check(minScrewY > -1e-6, `B install: screws are driven straight down without overshoot (min offset ${minScrewY.toFixed(5)})`);
+  check(!mB.drillMarks.visible && !mB.repairMarks.visible, 'B install: no roof marks while installed');
+
+  const seenDis = [];
+  let marksBeforeStep3 = false;
+  anim.playDisassemble(mB, {
+    speed: 2,
+    onStep: (i) => { if (seenDis[seenDis.length - 1] !== i) seenDis.push(i); if (i < 2 && (mB.drillMarks.visible || mB.repairMarks.visible)) marksBeforeStep3 = true; },
+  });
+  run();
+  check(seenDis.join(',') === '0,1,2,3', `B teardown visited steps in order (${seenDis.join(',')})`);
+  check(!marksBeforeStep3, 'B teardown: holes appear only after the screws and panels are removed');
+  check(screws.every((o) => !o.visible) && panels.every((o) => !o.visible), 'B teardown: screws and panels removed');
+  check(mB.drillMarks.visible && mB.repairMarks.visible, 'B teardown: drill holes and repair markers stay on the roof');
+
+  anim.restoreAssembled(mB);
+  check(screws.every((o) => o.visible) && panels.every((o) => o.visible), 'B restore: assembly back in place');
+  check(!mB.drillMarks.visible && !mB.repairMarks.visible, 'B restore: roof marks hidden again');
+
+  anim.playDisassemble(mB, { speed: 2 });
+  run();
+  anim.playInstall(mB, { speed: 2 });
+  check(!mB.drillMarks.visible && !mB.repairMarks.visible, 'B re-install after teardown starts from a clean roof');
+  anim.stopInstall(mB);
+  check(screws.every((o) => o.visible) && !mB.drillMarks.visible, 'B stopInstall shows the finished assembly');
 }
 
 // 4. Visualization modules: shade, flow, heatmap, rays

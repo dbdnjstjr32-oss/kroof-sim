@@ -3,6 +3,7 @@ import { CUSTOM_SPEC, ALL_IDS, SITES, WEATHER_PRESETS, INSULATION_OPTIONS } from
 
 export const SHARED_KEYS = [
   'mode', 'design', 'siteId', 'customSite', 'month', 'day', 'hour', 'weatherPreset', 'weather', 'roof', 'interior',
+  'cpSurface',
 ];
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -62,6 +63,7 @@ export function sanitize(raw) {
   group('interior', ['setpoint']);
   if (isObj(raw.interior) && typeof raw.interior.acOn === 'boolean') put('interior.acOn', raw.interior.acOn);
   group('customSite', ['lat', 'lon', 'tz']);
+  group('cpSurface', ['rhoSolar', 'epsBottom']);
   return out;
 }
 
