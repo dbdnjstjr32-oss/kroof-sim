@@ -6,6 +6,25 @@
 
 설치 없이 브라우저에서 동작합니다(PC·iPad·휴대폰). WebGL을 지원하는 최신 브라우저가 필요합니다.
 
+<div align="center">
+
+<img src="docs/media/demo.gif" alt="K-Roof 3D 시뮬레이터 조작 데모" width="100%" />
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/media/overview.png" alt="단일 설계안 3D 뷰 및 열해석" width="100%" /><br/>
+      <sub><b>단일 설계안 3D 뷰 · 태양 방위/일사량·열해석</b></sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/media/compare.png" alt="4동 나란히 비교 모드" width="100%" /><br/>
+      <sub><b>설계안 A–C′ 4동 비교 · 기류/온도 히트맵</b></sub>
+    </td>
+  </tr>
+</table>
+
+</div>
+
 ## 설계안
 
 | | 설계안 | 핵심 | 공기층 |
